@@ -14,14 +14,16 @@ st.title("Aurora Discord Server Core")
 st.write("Status: Active | Engine: google-genai | Grounding: Google Search")
 
 # --- CREDENTIALS & INITIALIZATION ---
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
-GEMINI_KEY = os.environ.get("GEMINI_KEY")
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
+GEMINI_KEY = os.environ.get("GEMINI_KEY") or st.secrets.get("GEMINI_KEY")
 
-client = genai.Client(api_key=GEMINI_KEY)
+if not DISCORD_TOKEN:
+    st.error("Missing DISCORD_TOKEN in Streamlit Secrets!")
+    print("CRITICAL: DISCORD_TOKEN is missing or None.")
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+if not GEMINI_KEY:
+    st.error("Missing GEMINI_KEY in Streamlit Secrets!")
+    print("CRITICAL: GEMINI_KEY is missing or None.")
 
 # --- SQLITE PERSISTENT MEMORY SETUP ---
 DB_FILE = "aurora_memory.db"
@@ -160,10 +162,25 @@ async def on_message(message):
 
 # --- PERSISTENT WORKER THREAD ---
 def run_discord_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(bot.start(DISCORD_TOKEN))
+    try:
+        print("Starting Discord client loop...")
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(bot.start(DISCORD_TOKEN))
+    except Exception as e:
+        print(f"FATAL: Discord worker thread crashed: {e}")
 
-if "bot_started" not in st.session_state:
-    st.session_state.bot_started = True
-    threading.Thread(target=run_discord_bot, daemon=True).start()
+# Check thread existence directly rather than relying solely on session_state
+bot_thread = None
+for th in threading.enumerate():
+    if th.name == "AuroraDiscordWorker":
+        bot_thread = th
+        break
+
+if bot_thread is None or not bot_thread.is_alive():
+    print("Spawning new AuroraDiscordWorker thread...")
+    worker = threading.Thread(target=run_discord_bot, name="AuroraDiscordWorker", daemon=True)
+    worker.start()
+else:
+    print("AuroraDiscordWorker thread is already active.")
+    
