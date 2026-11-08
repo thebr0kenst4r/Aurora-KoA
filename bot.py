@@ -3,6 +3,7 @@ import re
 import asyncio
 import threading
 import sqlite3
+import itertools
 import discord
 from discord.ext import commands
 from google import genai
@@ -12,21 +13,33 @@ import streamlit as st
 
 # --- STREAMLIT KEEP-ALIVE FRONTEND ---
 st.title("Aurora Discord Server Core")
-st.write("Status: Active | Engine: google-genai (aio) | Model: gemini-3.8-flash | Grounding: Google Search")
+st.write("Status: Active | Dynamic Routing: Flash -> Pro | Grounding: Conditional | Key Pool Active")
 
-# --- CREDENTIALS & INITIALIZATION ---
+# --- MULTI-KEY ROTATION & CLIENT POOL ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
-GEMINI_KEY = os.environ.get("GEMINI_KEY") or st.secrets.get("GEMINI_KEY")
+
+raw_keys = os.environ.get("GEMINI_KEYS") or st.secrets.get("GEMINI_KEYS") or os.environ.get("GEMINI_KEY") or st.secrets.get("GEMINI_KEY")
 
 if not DISCORD_TOKEN:
     st.error("Missing DISCORD_TOKEN in Streamlit Secrets!")
     print("CRITICAL: DISCORD_TOKEN is missing.")
 
-if not GEMINI_KEY:
-    st.error("Missing GEMINI_KEY in Streamlit Secrets!")
-    print("CRITICAL: GEMINI_KEY is missing.")
+if not raw_keys:
+    st.error("Missing GEMINI_KEYS or GEMINI_KEY in Streamlit Secrets!")
+    print("CRITICAL: No Gemini keys found.")
 
-client = genai.Client(api_key=GEMINI_KEY)
+# Split by comma or whitespace to support multiple keys
+KEY_POOL = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
+print(f"Loaded {len(KEY_POOL)} Gemini API Key(s) into the rotation pool.")
+
+# Thread-safe round-robin iterator for clients
+CLIENT_POOL = [genai.Client(api_key=k) for k in KEY_POOL]
+client_cycle = itertools.cycle(CLIENT_POOL)
+client_lock = threading.Lock()
+
+def get_next_client():
+    with client_lock:
+        return next(client_cycle)
 
 # --- BOT INSTANCE DEFINITION ---
 intents = discord.Intents.default()
@@ -64,7 +77,7 @@ def save_message(channel_id, user_id, role, content):
     conn.commit()
     conn.close()
 
-def get_recent_history(channel_id, limit=6):
+def get_recent_history(channel_id, limit=4):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -103,37 +116,62 @@ def contains_hostility_toward_aerith(text):
     has_insult = any(bad in clean for bad in INSULT_KEYWORDS)
     return has_name and has_insult
 
-# --- TENACITY ASYNC RETRY GENERATION ---
+# --- INTENT & RESOURCE ROUTING ---
+SEARCH_TRIGGERS = [
+    "search", "google", "look up", "lookup", "online", "latest news", "patch notes", "recent update", "current event"
+]
+
+ADVANCED_TRIGGERS = [
+    "deep think", "pro mode", "advanced analysis", "mastermind", "deep analysis", "complex calculation"
+]
+
+def needs_web_search(prompt: str) -> bool:
+    clean = prompt.lower()
+    return any(trigger in clean for trigger in SEARCH_TRIGGERS)
+
+def select_model(prompt: str) -> str:
+    clean = prompt.lower()
+    if any(trigger in clean for trigger in ADVANCED_TRIGGERS):
+        return "gemini-3.8-pro"  # Advanced: High capability for complex orchestration
+    return "gemini-3.8-flash"    # Lowest / Middle baseline: High speed, low quota draw
+
+# --- ASYNC MULTI-KEY RESILIENT INFERENCE ---
 def is_rate_limit_error(exception):
-    """Filters so tenacity only retries transient rate limit (429) errors."""
     err_str = str(exception)
     return "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
 
 @retry(
-    wait=wait_random_exponential(multiplier=1, max=60),
-    stop=stop_after_attempt(5),
+    wait=wait_random_exponential(multiplier=1, max=30),
+    stop=stop_after_attempt(len(CLIENT_POOL) * 2 if len(CLIENT_POOL) > 1 else 3),
     retry=retry_if_exception(is_rate_limit_error),
     reraise=True
 )
-async def async_ask_gemini(contents, model_name="gemini-3.8-flash"):
-    """
-    Calls Gemini asynchronously with random exponential backoff jitter on 429 errors.
-    """
-    response = await client.aio.models.generate_content(
+async def call_gemini_with_fallback(contents, model_name, use_search=False):
+    # Grab next client in rotation on each attempt
+    active_client = get_next_client()
+    
+    config_params = {
+        "system_instruction": AURORA_SYSTEM_INSTRUCTION,
+        "temperature": 0.7,
+    }
+    
+    # Grounding only enabled if specifically triggered
+    if use_search:
+        config_params["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+        
+    config = types.GenerateContentConfig(**config_params)
+    
+    response = await active_client.aio.models.generate_content(
         model=model_name,
         contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=AURORA_SYSTEM_INSTRUCTION,
-            temperature=0.7,
-            tools=[types.Tool(google_search=types.GoogleSearch())]
-        )
+        config=config
     )
     return response.text
 
 # --- DISCORD EVENT LISTENERS ---
 @bot.event
 async def on_ready():
-    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Grounding and memory initialized.")
+    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Adaptive routing active.")
 
 @bot.event
 async def on_message(message):
@@ -154,21 +192,28 @@ async def on_message(message):
     elif not clean_prompt:
         return
 
-    # Fetch recent conversation context and append current prompt
-    history = get_recent_history(message.channel.id, limit=6)
-    contents = history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
+    # Dynamic Routing Decisions
+    use_search = needs_web_search(clean_prompt)
+    model_name = select_model(clean_prompt)
 
-    # Log user turn to memory
+    # Token-Saving Optimization:
+    # If conducting an external search, omit lengthy conversation history to minimize quota burn.
+    if use_search:
+        contents = [{"role": "user", "parts": [{"text": clean_prompt}]}]
+    else:
+        history = get_recent_history(message.channel.id, limit=4)
+        contents = history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
+
     save_message(message.channel.id, message.author.id, "user", clean_prompt)
 
     async with message.channel.typing():
         try:
-            raw_text = await async_ask_gemini(contents=contents)
+            raw_text = await call_gemini_with_fallback(contents, model_name=model_name, use_search=use_search)
             reply_text = raw_text if raw_text else "The celestial threads waver... no response was formed."
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                reply_text = "The cosmic resonance stream is temporarily exhausted (Rate Limit Reached). Give me a moment to restore my strength."
+                reply_text = "The cosmic resonance stream across all keys is currently exhausted. Please give the ley lines a moment to replenish."
             else:
                 print(f"Error during execution: {e}")
                 reply_text = f"A rift occurred in the resonance stream: `{e}`"
