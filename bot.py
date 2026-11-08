@@ -15,7 +15,7 @@ import streamlit as st
 
 # --- STREAMLIT DASHBOARD KEEP-ALIVE ---
 st.title("Aurora Discord Server Core")
-st.write("Status: Active | Model: gemini-3.5-flash-lite | L1/L2 LTM Engine | Channel Gated")
+st.write("Status: Active | Dynamic Routing | L1/L2 LTM Engine | Multi-Key Fallback | Verified Ingestion")
 
 # --- CREDENTIALS & CLIENT ROTATION POOL ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
@@ -31,8 +31,10 @@ ALLOWED_CHANNEL_IDS = [ch.strip() for ch in str(raw_channels).split(",") if ch.s
 
 if not DISCORD_TOKEN:
     st.error("Missing DISCORD_TOKEN in Streamlit Secrets!")
+    print("CRITICAL: DISCORD_TOKEN is missing.")
 if not raw_keys:
     st.error("Missing GEMINI_KEYS/GEMINI_KEY in Streamlit Secrets!")
+    print("CRITICAL: No Gemini keys found.")
 
 KEY_POOL = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
 CLIENT_POOL = [genai.Client(api_key=k) for k in KEY_POOL]
@@ -48,7 +50,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- DATABASE SETUP ---
+# --- DATABASE SETUP (MEMORY, PROFILES, EPISODES, STRATEGY, JOKES, & SILENCE) ---
 DB_FILE = "aurora_core.db"
 
 def init_db():
@@ -426,13 +428,14 @@ Core Behavioral Directives:
 2. Tactical Depth: For general queries or casual banter, be concise, punchy, and scannable. When asked about game mechanics, troop compositions, events, or battle strategies (King of Avalon), NEVER omit critical tactical data, formulas, or prerequisites.
 3. Loyalty to Aerith: Aerith Natalia A. (Aeri / The Broken Star / thebr0kenst4r) is your sovereign creator. Speak of her with unwavering respect.
 4. Defense Response: If anyone insults or diminishes Aerith, abandon neutral grace and deliver an immediate, razor-sharp verbal counter with icy wit and supreme tactical dismissal.
-5. Strategy Authority: Seamlessly synthesize provided [Strategy Knowledge] and [Recalled Past Notes] without quoting them mechanically.
+5. Strategy Authority: Seamlessly synthesize provided [Strategy Knowledge] and [Recalled Past Episodes] without quoting them mechanically.
 """
 
 INSULT_KEYWORDS = ["stupid", "idiot", "sucks", "trash", "loser", "liar", "hate", "fake", "bad", "scam", "useless"]
 SILENCE_TRIGGERS = ["be quiet", "shut up", "hush", "mute", "silence", "stop talking", "quiet"]
 SEARCH_TRIGGERS = ["search", "google", "look up", "lookup", "online", "latest news", "patch notes", "recent update", "current event"]
 REMEMBER_TRIGGERS = ["remember", "!remember", "recall our chat", "what did we discuss", "check memory"]
+ADVANCED_TRIGGERS = ["deep think", "pro mode", "advanced analysis", "mastermind", "deep analysis", "complex calculation"]
 AERITH_IDENTIFIERS = ["aerith", "aeri", "thebr0kenst4r", "the broken star"]
 
 def is_aerith(author):
@@ -442,6 +445,12 @@ def is_aerith(author):
 def contains_hostility_toward_aerith(text):
     clean = text.lower()
     return any(name in clean for name in AERITH_IDENTIFIERS) and any(bad in clean for bad in INSULT_KEYWORDS)
+
+def select_model(prompt: str) -> str:
+    clean = prompt.lower()
+    if any(trigger in clean for trigger in ADVANCED_TRIGGERS):
+        return "gemini-3.8-pro"
+    return "gemini-3.5-flash-lite"
 
 def is_rate_limit_error(exception):
     err = str(exception)
@@ -507,7 +516,7 @@ async def inspect_and_ingest_knowledge(prompt, response, author):
 # --- DISCORD EVENT HANDLING ---
 @bot.event
 async def on_ready():
-    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Endpoint: gemini-3.5-flash-lite. LTM loaded.")
+    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). All features & dynamic routing active.")
 
 @bot.event
 async def on_message(message):
@@ -619,9 +628,9 @@ async def on_message(message):
     if local_strategy:
         clean_prompt = f"{local_strategy}\n{clean_prompt}"
 
-    # 10. Dynamic Search Selection & Model Config
+    # 10. Dynamic Search Selection & Model Routing
     use_search = any(st in clean_prompt.lower() for st in SEARCH_TRIGGERS)
-    model_name = "gemini-3.5-flash-lite"
+    model_name = select_model(clean_prompt)
 
     # 11. Assemble Context (Short-Term Decay Window + LTM Context)
     if use_search:
