@@ -7,11 +7,12 @@ import discord
 from discord.ext import commands
 from google import genai
 from google.genai import types
+from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 import streamlit as st
 
 # --- STREAMLIT KEEP-ALIVE FRONTEND ---
 st.title("Aurora Discord Server Core")
-st.write("Status: Active | Engine: google-genai | Model: gemini-3.8-flash | Grounding: Google Search")
+st.write("Status: Active | Engine: google-genai (aio) | Model: gemini-3.8-flash | Grounding: Google Search")
 
 # --- CREDENTIALS & INITIALIZATION ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
@@ -102,6 +103,33 @@ def contains_hostility_toward_aerith(text):
     has_insult = any(bad in clean for bad in INSULT_KEYWORDS)
     return has_name and has_insult
 
+# --- TENACITY ASYNC RETRY GENERATION ---
+def is_rate_limit_error(exception):
+    """Filters so tenacity only retries transient rate limit (429) errors."""
+    err_str = str(exception)
+    return "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+
+@retry(
+    wait=wait_random_exponential(multiplier=1, max=60),
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception(is_rate_limit_error),
+    reraise=True
+)
+async def async_ask_gemini(contents, model_name="gemini-3.8-flash"):
+    """
+    Calls Gemini asynchronously with random exponential backoff jitter on 429 errors.
+    """
+    response = await client.aio.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=AURORA_SYSTEM_INSTRUCTION,
+            temperature=0.7,
+            tools=[types.Tool(google_search=types.GoogleSearch())]
+        )
+    )
+    return response.text
+
 # --- DISCORD EVENT LISTENERS ---
 @bot.event
 async def on_ready():
@@ -134,47 +162,24 @@ async def on_message(message):
     save_message(message.channel.id, message.author.id, "user", clean_prompt)
 
     async with message.channel.typing():
-        reply_text = None
-        max_retries = 3
-        delay = 2  # initial wait time in seconds
-
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content(
-                    model='gemini-3.8-flash',
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=AURORA_SYSTEM_INSTRUCTION,
-                        temperature=0.7,
-                        tools=[types.Tool(google_search=types.GoogleSearch())]
-                    )
-                )
-                reply_text = response.text if response.text else "The celestial threads waver... no response was formed."
-                break  # Successful generation, exit retry loop
-
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    if attempt < max_retries - 1:
-                        print(f"Rate limit encountered (429). Retrying in {delay} seconds...")
-                        await asyncio.sleep(delay)
-                        delay *= 2  # Exponential backoff: 2s -> 4s
-                        continue
-                    else:
-                        reply_text = "The cosmic resonance stream is temporarily exhausted (Rate Limit Reached). Give me a moment to restore my strength."
-                else:
-                    print(f"Error during execution: {e}")
-                    reply_text = f"A rift occurred in the resonance stream: `{e}`"
-                    break
-
-        if reply_text:
-            save_message(message.channel.id, message.author.id, "model", reply_text)
-
-            if len(reply_text) <= 2000:
-                await message.reply(reply_text)
+        try:
+            raw_text = await async_ask_gemini(contents=contents)
+            reply_text = raw_text if raw_text else "The celestial threads waver... no response was formed."
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                reply_text = "The cosmic resonance stream is temporarily exhausted (Rate Limit Reached). Give me a moment to restore my strength."
             else:
-                for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
-                    await message.channel.send(chunk)
+                print(f"Error during execution: {e}")
+                reply_text = f"A rift occurred in the resonance stream: `{e}`"
+
+        save_message(message.channel.id, message.author.id, "model", reply_text)
+
+        if len(reply_text) <= 2000:
+            await message.reply(reply_text)
+        else:
+            for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
+                await message.channel.send(chunk)
 
     await bot.process_commands(message)
 
