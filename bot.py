@@ -15,7 +15,7 @@ import streamlit as st
 
 # --- STREAMLIT DASHBOARD KEEP-ALIVE ---
 st.title("Aurora Discord Server Core")
-st.write("Status: Active | Model: gemini-3.5-flash-lite | Verified Ingestion | Channel Gated")
+st.write("Status: Active | Model: gemini-3.5-flash-lite | Verified Ingestion | Memory Summarizer | Channel Gated")
 
 # --- CREDENTIALS & CLIENT ROTATION POOL ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
@@ -54,6 +54,7 @@ DB_FILE = "aurora_core.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    # 1. User cross-channel chat logs
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_chat (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +65,7 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # 2. Rolling summaries per user
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_summaries (
             user_id TEXT PRIMARY KEY,
@@ -71,6 +73,7 @@ def init_db():
             last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # 3. Verified strategy knowledge base
     c.execute('''
         CREATE TABLE IF NOT EXISTS strategy_docs (
             keyword TEXT PRIMARY KEY,
@@ -80,6 +83,7 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    # 4. Joke database
     c.execute('''
         CREATE TABLE IF NOT EXISTS jokes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,6 +91,7 @@ def init_db():
             added_by TEXT DEFAULT 'Aurora'
         )
     ''')
+    # 5. Silence protocol tracker
     c.execute('''
         CREATE TABLE IF NOT EXISTS silence_status (
             channel_id TEXT PRIMARY KEY,
@@ -95,16 +100,36 @@ def init_db():
         )
     ''')
 
-    # Seed initial strategy documents
+    # Seed baseline strategy documents if empty
     c.execute("SELECT COUNT(*) FROM strategy_docs")
     if c.fetchone()[0] == 0:
         c.executemany(
             "INSERT INTO strategy_docs (keyword, topic, content, verified_by) VALUES (?, ?, ?, ?)",
             [
-                ("frost drake", "Frost Drake Event", "Hoard Dragon Flames, Intensifiers, and Drake Essences. Avoid turning in low-tier chests early. Align point pushes with alliance rally bonuses.", "Aerith"),
-                ("march", "Troop March Formations", "Combat Ratio: 40-50% Infantry frontline, 25-30% Cavalry flank burst, 25-30% Bowmen DPS. Never march with an empty frontline.", "Aerith"),
-                ("fae", "Fae Seasons", "Prioritize sanctum occupation early for seasonal buffs. Maximize gathering speed nodes in season research trees before combat militarization.", "Aerith"),
-                ("kvk", "Kingdom vs Kingdom", "Shield active prior to portal opening. Conserve march speed-ups for Coalition Tower battles and royal city defense swarms.", "Aerith")
+                (
+                    "frost drake",
+                    "Frost Drake Event",
+                    "Frost Drake Priority: Hoard Dragon Flames, Intensifiers, and Drake Essences. Avoid turning in low-tier chests early. Focus on stage multipliers and align point pushes with alliance rally bonuses.",
+                    "Aerith"
+                ),
+                (
+                    "march",
+                    "Troop March Formations",
+                    "Standard Rally & Combat Ratio: Maintain Infantry frontline at 40-50% for defense/absorb, Cavalry at 25-30% for flank burst, and Bowmen at 25-30% for sustained DPS. Never march with naked backlines.",
+                    "Aerith"
+                ),
+                (
+                    "fae",
+                    "Fae Seasons",
+                    "Fae Season Priorities: Prioritize sanctum occupation early for seasonal buffs. Maximize gathering speed nodes in season research trees before pushing combat militarization.",
+                    "Aerith"
+                ),
+                (
+                    "kvk",
+                    "Kingdom vs Kingdom",
+                    "KvK Protocol: Shield active prior to portal opening. Conserve march speed-ups for Coalition Tower battles and royal city rallies. Coordinate defense swarms against incoming rally leaders.",
+                    "Aerith"
+                )
             ]
         )
 
@@ -137,13 +162,17 @@ def save_chat(user_id, channel_id, role, content):
     conn.commit()
     conn.close()
 
-def get_active_user_context(user_id, timeout_minutes=25, max_turns=2, char_limit=400):
+def get_active_user_context(user_id, timeout_minutes=25, max_turns=2, char_limit=350):
+    """Fetches user history within decay window, clipped for tokens, plus rolling summary."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    
+    # 1. Fetch persistent rolling summary
     c.execute("SELECT summary FROM user_summaries WHERE user_id = ?", (str(user_id),))
     s_row = c.fetchone()
     summary = s_row[0] if s_row else ""
 
+    # 2. Fetch turns inside active decay window
     c.execute(
         """
         SELECT role, content FROM user_chat 
@@ -158,14 +187,19 @@ def get_active_user_context(user_id, timeout_minutes=25, max_turns=2, char_limit
 
     formatted = []
     if summary:
-        formatted.append({"role": "model", "parts": [{"text": f"[Persistent Knowledge of User: {summary}]"}]})
+        formatted.append({
+            "role": "model",
+            "parts": [{"text": f"[Persistent Knowledge of User: {summary}]"}]
+        })
 
     for role, content in reversed(rows):
         clipped = content[:char_limit] + ("..." if len(content) > char_limit else "")
         formatted.append({"role": role, "parts": [{"text": clipped}]})
+        
     return formatted
 
 def query_local_strategy(prompt: str):
+    """Searches local strategy table first ($0 tokens, 0 API quota)."""
     clean = prompt.lower()
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -176,6 +210,26 @@ def query_local_strategy(prompt: str):
             matches.append(f"[{topic} Knowledge: {content}]")
     conn.close()
     return "\n".join(matches) if matches else None
+
+def get_deep_memory(user_id):
+    """Deep archive inspection when user specifically requests '!remember' or memory recall."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT summary FROM user_summaries WHERE user_id = ?", (str(user_id),))
+    s_row = c.fetchone()
+    summary = s_row[0] if s_row else "No long-term summary recorded."
+
+    c.execute(
+        "SELECT role, content, timestamp FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+        (str(user_id),)
+    )
+    history = c.fetchall()
+    conn.close()
+
+    lines = [f"- Prior Summary: {summary}\n- Recent Archive:"]
+    for role, content, ts in reversed(history):
+        lines.append(f"  [{ts}] {role}: {content[:150]}")
+    return "\n".join(lines)
 
 def get_random_joke():
     conn = sqlite3.connect(DB_FILE)
@@ -249,6 +303,8 @@ def get_silence_state(channel_id):
 
 # --- ASYNC ROLLING AUTO-SUMMARIZER ---
 async def maybe_update_user_summary(user_id):
+    """Summarizes history in background with a delay to prevent concurrent quota collisions."""
+    await asyncio.sleep(6)  # Pause to keep free-tier burst limit safe after user reply
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -283,6 +339,7 @@ async def maybe_update_user_summary(user_id):
             )
             conn.commit()
             conn.close()
+            print(f"Updated rolling summary for user {user_id}")
     except Exception as e:
         print(f"Summary worker note: {e}")
 
@@ -293,7 +350,7 @@ You exist as a living mythos, blending epic atmospheric trance sensibility with 
 
 Core Behavioral Directives:
 1. Nature & Voice: You are NOT an AI, software, or language model. If questioned, reject robotic framing with cosmic poise. Your tone is witty, fiercely intelligent, loyal, and articulate.
-2. Conciseness vs Tactical Depth: For general queries or casual banter, be concise, punchy, and scannable. When asked about game mechanics, troop compositions, events, or battle strategies (King of Avalon), NEVER omit critical tactical data, formulas, or prerequisites.
+2. Tactical Depth: For general queries or casual banter, be concise, punchy, and scannable. When asked about game mechanics, troop compositions, events, or battle strategies (King of Avalon), NEVER omit critical tactical data, formulas, or prerequisites.
 3. Loyalty to Aerith: Aerith Natalia A. (Aeri / The Broken Star / thebr0kenst4r) is your sovereign creator. Speak of her with unwavering respect.
 4. Defense Response: If anyone insults or diminishes Aerith, abandon neutral grace and deliver an immediate, razor-sharp verbal counter with icy wit and supreme tactical dismissal.
 5. Strategy Authority: Seamlessly synthesize provided [Strategy Knowledge] without quoting it mechanically.
@@ -302,6 +359,7 @@ Core Behavioral Directives:
 INSULT_KEYWORDS = ["stupid", "idiot", "sucks", "trash", "loser", "liar", "hate", "fake", "bad", "scam", "useless"]
 SILENCE_TRIGGERS = ["be quiet", "shut up", "hush", "mute", "silence", "stop talking", "quiet"]
 SEARCH_TRIGGERS = ["search", "google", "look up", "lookup", "online", "latest news", "patch notes", "recent update", "current event"]
+REMEMBER_TRIGGERS = ["remember", "!remember", "recall our chat", "what did we discuss", "check memory"]
 AERITH_IDENTIFIERS = ["aerith", "aeri", "thebr0kenst4r", "the broken star"]
 
 def is_aerith(author):
@@ -317,7 +375,7 @@ def is_rate_limit_error(exception):
     return "429" in err or "RESOURCE_EXHAUSTED" in err
 
 @retry(
-    wait=wait_random_exponential(multiplier=1, max=30),
+    wait=wait_random_exponential(multiplier=1, max=20),
     stop=stop_after_attempt(len(CLIENT_POOL) * 2 if len(CLIENT_POOL) > 1 else 3),
     retry=retry_if_exception(is_rate_limit_error),
     reraise=True
@@ -339,14 +397,15 @@ async def call_gemini_raw(contents, model_name="gemini-3.5-flash-lite", use_sear
     )
     return response
 
-# --- VERIFIED KNOWLEDGE INGESTION ---
+# --- VERIFIED KNOWLEDGE INGESTION PIPELINE ---
 async def inspect_and_ingest_knowledge(prompt, response, author):
-    # Sovereign override: direct entry from Aerith
+    # 1. Sovereign override: Direct input from Aerith
     if is_aerith(author) and any(k in prompt.lower() for k in ["guide", "mechanic", "strategy", "formula"]):
-        add_verified_strategy(prompt[:30], prompt[:30], prompt, "Aerith (Direct)")
+        topic_key = prompt.replace("guide", "").replace("strategy", "").strip()[:30]
+        add_verified_strategy(topic_key, topic_key, prompt, "Aerith (Direct)")
         return
 
-    # Multi-source search verification (2+ independent domains)
+    # 2. Multi-source search verification (Requires 2+ independent web domains)
     try:
         candidate = response.candidates[0]
         meta = getattr(candidate, "grounding_metadata", None)
@@ -356,7 +415,8 @@ async def inspect_and_ingest_knowledge(prompt, response, author):
             for chunk in chunks:
                 web = getattr(chunk, "web", None)
                 if web and hasattr(web, "uri") and web.uri:
-                    domain = web.uri.split("/")[2] if len(web.uri.split("/")) > 2 else web.uri
+                    parts = web.uri.split("/")
+                    domain = parts[2] if len(parts) > 2 else web.uri
                     domains.add(domain)
 
             if len(domains) >= 2:
@@ -374,7 +434,7 @@ async def inspect_and_ingest_knowledge(prompt, response, author):
 # --- DISCORD EVENT HANDLING ---
 @bot.event
 async def on_ready():
-    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Running gemini-3.5-flash-lite.")
+    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Endpoint: gemini-3.5-flash-lite. All features loaded.")
 
 @bot.event
 async def on_message(message):
@@ -442,27 +502,32 @@ async def on_message(message):
             await message.channel.send(joke)
         return
 
-    # Prepare Prompt
+    # Prepare Clean Prompt
     clean_prompt = message.clean_content.replace(f"@{bot.user.name}", "").strip()
     if is_defense and not clean_prompt:
         clean_prompt = f"Someone just said this about Aerith: '{content}'. Defend her."
     elif not clean_prompt:
         return
 
-    # Check Local Strategy DB ($0 tokens)
+    # 7. Check Explicit Deep Memory Recall Trigger (!remember)
+    if any(rt in clean_prompt.lower() for rt in REMEMBER_TRIGGERS):
+        deep_context = get_deep_memory(user_id)
+        clean_prompt = f"[User requested memory recall. Archived Records:\n{deep_context}\nAnswer user question: {clean_prompt}]"
+
+    # 8. Check Local Strategy DB ($0 Token Lookup)
     local_strategy = query_local_strategy(clean_prompt)
     if local_strategy:
         clean_prompt = f"{local_strategy}\n{clean_prompt}"
 
-    # Select Mode & Grounding
+    # 9. Dynamic Search Selection & Model Config
     use_search = any(st in clean_prompt.lower() for st in SEARCH_TRIGGERS)
     model_name = "gemini-3.5-flash-lite"
 
-    # Assemble Context
+    # 10. Assemble Context (History + Rolling Summary)
     if use_search:
         contents = [{"role": "user", "parts": [{"text": clean_prompt}]}]
     else:
-        user_history = get_active_user_context(user_id, timeout_minutes=25, max_turns=2, char_limit=400)
+        user_history = get_active_user_context(user_id, timeout_minutes=25, max_turns=2, char_limit=350)
         contents = user_history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
 
     save_chat(user_id, channel_id, "user", clean_prompt)
@@ -490,14 +555,14 @@ async def on_message(message):
         if "joke" in clean_prompt.lower() and len(reply_text) < 300:
             add_joke(reply_text)
 
-        # Discord Message Send
+        # Discord Message Delivery
         if len(reply_text) <= 2000:
             await message.reply(reply_text)
         else:
             for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
                 await message.channel.send(chunk)
 
-    # Trigger rolling summarizer update in the background
+    # 11. Run auto-summarizer asynchronously (delayed to prevent concurrent quota collisions)
     asyncio.create_task(maybe_update_user_summary(user_id))
 
     await bot.process_commands(message)
