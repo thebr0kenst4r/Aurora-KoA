@@ -134,18 +134,40 @@ async def on_message(message):
     save_message(message.channel.id, message.author.id, "user", clean_prompt)
 
     async with message.channel.typing():
-        try:
-            response = client.models.generate_content(
-                model='gemini-3.8-flash',
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=AURORA_SYSTEM_INSTRUCTION,
-                    temperature=0.7,
-                    tools=[types.Tool(google_search=types.GoogleSearch())]
-                )
-            )
+        reply_text = None
+        max_retries = 3
+        delay = 2  # initial wait time in seconds
 
-            reply_text = response.text if response.text else "The celestial threads waver... no response was formed."
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model='gemini-3.8-flash',
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=AURORA_SYSTEM_INSTRUCTION,
+                        temperature=0.7,
+                        tools=[types.Tool(google_search=types.GoogleSearch())]
+                    )
+                )
+                reply_text = response.text if response.text else "The celestial threads waver... no response was formed."
+                break  # Successful generation, exit retry loop
+
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    if attempt < max_retries - 1:
+                        print(f"Rate limit encountered (429). Retrying in {delay} seconds...")
+                        await asyncio.sleep(delay)
+                        delay *= 2  # Exponential backoff: 2s -> 4s
+                        continue
+                    else:
+                        reply_text = "The cosmic resonance stream is temporarily exhausted (Rate Limit Reached). Give me a moment to restore my strength."
+                else:
+                    print(f"Error during execution: {e}")
+                    reply_text = f"A rift occurred in the resonance stream: `{e}`"
+                    break
+
+        if reply_text:
             save_message(message.channel.id, message.author.id, "model", reply_text)
 
             if len(reply_text) <= 2000:
@@ -153,10 +175,6 @@ async def on_message(message):
             else:
                 for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
                     await message.channel.send(chunk)
-
-        except Exception as e:
-            print(f"Error during execution: {e}")
-            await message.reply(f"A rift occurred in the resonance stream: `{e}`")
 
     await bot.process_commands(message)
 
