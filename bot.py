@@ -11,7 +11,7 @@ import streamlit as st
 
 # --- STREAMLIT KEEP-ALIVE FRONTEND ---
 st.title("Aurora Discord Server Core")
-st.write("Status: Active | Engine: google-genai | Grounding: Google Search")
+st.write("Status: Active | Engine: google-genai | Model: gemini-3.8-flash | Grounding: Google Search")
 
 # --- CREDENTIALS & INITIALIZATION ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
@@ -126,13 +126,18 @@ async def on_message(message):
     elif not clean_prompt:
         return
 
+    # Fetch recent conversation context and append current prompt
+    history = get_recent_history(message.channel.id, limit=6)
+    contents = history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
+
+    # Log user turn to memory
     save_message(message.channel.id, message.author.id, "user", clean_prompt)
 
     async with message.channel.typing():
         try:
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=clean_prompt,
+                model='gemini-3.8-flash',
+                contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=AURORA_SYSTEM_INSTRUCTION,
                     temperature=0.7,
