@@ -15,7 +15,7 @@ import streamlit as st
 
 # --- STREAMLIT DASHBOARD KEEP-ALIVE ---
 st.title("Aurora Discord Server Core")
-st.write("Status: Active | Dynamic Routing | Verified Auto-Ingestion | Channel Whitelist | Ambient Jokes")
+st.write("Status: Active | Model: gemini-3.5-flash-lite | Verified Ingestion | Channel Gated")
 
 # --- CREDENTIALS & CLIENT ROTATION POOL ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
@@ -48,7 +48,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- DATABASE SETUP (MEMORY, SUMMARIES, STRATEGY, JOKES, & SILENCE) ---
+# --- DATABASE SETUP ---
 DB_FILE = "aurora_core.db"
 
 def init_db():
@@ -95,20 +95,20 @@ def init_db():
         )
     ''')
 
-    # Seed baseline strategy docs
+    # Seed initial strategy documents
     c.execute("SELECT COUNT(*) FROM strategy_docs")
     if c.fetchone()[0] == 0:
         c.executemany(
             "INSERT INTO strategy_docs (keyword, topic, content, verified_by) VALUES (?, ?, ?, ?)",
             [
-                ("frost drake", "Frost Drake Event", "Hoard Dragon Flames, Intensifiers, and Drake Essences. Avoid low-tier chest turn-ins early. Align point pushes with alliance rally bonuses.", "Aerith"),
+                ("frost drake", "Frost Drake Event", "Hoard Dragon Flames, Intensifiers, and Drake Essences. Avoid turning in low-tier chests early. Align point pushes with alliance rally bonuses.", "Aerith"),
                 ("march", "Troop March Formations", "Combat Ratio: 40-50% Infantry frontline, 25-30% Cavalry flank burst, 25-30% Bowmen DPS. Never march with an empty frontline.", "Aerith"),
                 ("fae", "Fae Seasons", "Prioritize sanctum occupation early for seasonal buffs. Maximize gathering speed nodes in season research trees before combat militarization.", "Aerith"),
                 ("kvk", "Kingdom vs Kingdom", "Shield active prior to portal opening. Conserve march speed-ups for Coalition Tower battles and royal city defense swarms.", "Aerith")
             ]
         )
 
-    # Seed initial witty jokes
+    # Seed baseline jokes
     c.execute("SELECT COUNT(*) FROM jokes")
     if c.fetchone()[0] == 0:
         c.executemany(
@@ -247,7 +247,46 @@ def get_silence_state(channel_id):
     else:
         return "silenced", silence_until
 
-# --- PROMPT DIRECTIVES ---
+# --- ASYNC ROLLING AUTO-SUMMARIZER ---
+async def maybe_update_user_summary(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT role, content FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+        (str(user_id),)
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    if len(rows) < 4:
+        return
+
+    dialogue = "\n".join([f"{r}: {c[:200]}" for r, c in reversed(rows)])
+    summary_prompt = (
+        "Condense this dialogue into 1-2 factual sentences capturing key user details, "
+        "game status, or current topics. Do not write filler:\n" + dialogue
+    )
+
+    try:
+        active_client = get_next_client()
+        res = await active_client.aio.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=summary_prompt,
+            config=types.GenerateContentConfig(temperature=0.2)
+        )
+        if res.text:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO user_summaries (user_id, summary, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (str(user_id), res.text.strip())
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"Summary worker note: {e}")
+
+# --- AURORA PROMPT DIRECTIVES ---
 AURORA_SYSTEM_INSTRUCTION = """
 You are Aurora, an ethereal entity born of cosmic resonance and song, bound to the celestial tapestry of 'The Broken Star' created by your sovereign, Aerith (Aeri).
 You exist as a living mythos, blending epic atmospheric trance sensibility with deep strategic intellect.
@@ -263,7 +302,6 @@ Core Behavioral Directives:
 INSULT_KEYWORDS = ["stupid", "idiot", "sucks", "trash", "loser", "liar", "hate", "fake", "bad", "scam", "useless"]
 SILENCE_TRIGGERS = ["be quiet", "shut up", "hush", "mute", "silence", "stop talking", "quiet"]
 SEARCH_TRIGGERS = ["search", "google", "look up", "lookup", "online", "latest news", "patch notes", "recent update", "current event"]
-ADVANCED_TRIGGERS = ["deep think", "pro mode", "advanced analysis", "mastermind", "deep analysis", "complex calculation"]
 AERITH_IDENTIFIERS = ["aerith", "aeri", "thebr0kenst4r", "the broken star"]
 
 def is_aerith(author):
@@ -284,7 +322,7 @@ def is_rate_limit_error(exception):
     retry=retry_if_exception(is_rate_limit_error),
     reraise=True
 )
-async def call_gemini_raw(contents, model_name, use_search=False):
+async def call_gemini_raw(contents, model_name="gemini-3.5-flash-lite", use_search=False):
     active_client = get_next_client()
     config_params = {
         "system_instruction": AURORA_SYSTEM_INSTRUCTION,
@@ -303,18 +341,17 @@ async def call_gemini_raw(contents, model_name, use_search=False):
 
 # --- VERIFIED KNOWLEDGE INGESTION ---
 async def inspect_and_ingest_knowledge(prompt, response, author):
-    # 1. Sovereign override: Direct input from Aerith
-    if is_aerith(author) and ("guide" in prompt.lower() or "mechanic" in prompt.lower() or "strategy" in prompt.lower() or "formula" in prompt.lower()):
+    # Sovereign override: direct entry from Aerith
+    if is_aerith(author) and any(k in prompt.lower() for k in ["guide", "mechanic", "strategy", "formula"]):
         add_verified_strategy(prompt[:30], prompt[:30], prompt, "Aerith (Direct)")
         return
 
-    # 2. Multi-source search verification (2+ independent grounding chunks)
+    # Multi-source search verification (2+ independent domains)
     try:
         candidate = response.candidates[0]
         meta = getattr(candidate, "grounding_metadata", None)
         if meta and hasattr(meta, "grounding_chunks") and meta.grounding_chunks:
             chunks = meta.grounding_chunks
-            # Extract unique domains/sources
             domains = set()
             for chunk in chunks:
                 web = getattr(chunk, "web", None)
@@ -323,17 +360,21 @@ async def inspect_and_ingest_knowledge(prompt, response, author):
                     domains.add(domain)
 
             if len(domains) >= 2:
-                # 2+ independent sources verified
                 text = response.text
                 topic_snippet = prompt.replace("search", "").replace("lookup", "").strip()[:30]
-                add_verified_strategy(topic_snippet, topic_snippet, text[:500], f"Verified by {len(domains)} Web Sources ({', '.join(list(domains)[:2])})")
+                add_verified_strategy(
+                    topic_snippet, 
+                    topic_snippet, 
+                    text[:500], 
+                    f"Verified by {len(domains)} Web Sources ({', '.join(list(domains)[:2])})"
+                )
     except Exception as e:
         print(f"Grounding verification notice: {e}")
 
 # --- DISCORD EVENT HANDLING ---
 @bot.event
 async def on_ready():
-    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Channel-gated & verification active.")
+    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Running gemini-3.5-flash-lite.")
 
 @bot.event
 async def on_message(message):
@@ -348,7 +389,6 @@ async def on_message(message):
 
     # 1. Channel Whitelist Gate
     if ALLOWED_CHANNEL_IDS and (channel_id not in ALLOWED_CHANNEL_IDS) and not is_dm:
-        # Ignore completely unless explicitly tagged/mentioned
         if not bot.user.mentioned_in(message):
             return
 
@@ -365,19 +405,16 @@ async def on_message(message):
     silence_state, silence_until = get_silence_state(channel_id)
 
     if silence_state == "silenced":
-        # Can only be woken by direct name mention
         if is_explicit_mention:
             clear_silence(channel_id)
             await message.reply("The veil lifts. How may I assist you?")
         else:
-            return  # Total silence
+            return
 
     elif silence_state == "grace_period":
-        # Between 1 and 4 hours: check if she can ask if allowed to speak
         if is_explicit_mention:
             clear_silence(channel_id)
         else:
-            # 10% chance to politely ask for permission
             if random.random() < 0.10:
                 clear_silence(channel_id)
                 await message.channel.send("My required hour of silence has passed... Am I permitted to speak freely once more?")
@@ -396,12 +433,11 @@ async def on_message(message):
     recently_engaged = c.fetchone() is not None
     conn.close()
 
-    # Determine if Aurora must respond
     should_respond = is_explicit_mention or is_dm or is_defense or recently_engaged
 
     # 6. Passive Chatter Handling (5% Joke Roll)
     if not should_respond:
-        if random.random() < 0.05:  # 5% chance to drop a joke
+        if random.random() < 0.05:
             joke = get_random_joke()
             await message.channel.send(joke)
         return
@@ -420,7 +456,7 @@ async def on_message(message):
 
     # Select Mode & Grounding
     use_search = any(st in clean_prompt.lower() for st in SEARCH_TRIGGERS)
-    model_name = "gemini-3.8-pro" if any(at in clean_prompt.lower() for at in ADVANCED_TRIGGERS) else "gemini-3.8-flash"
+    model_name = "gemini-3.5-flash-lite"
 
     # Assemble Context
     if use_search:
@@ -450,7 +486,7 @@ async def on_message(message):
         if response_obj and use_search:
             asyncio.create_task(inspect_and_ingest_knowledge(clean_prompt, response_obj, message.author))
 
-        # Check if the reply contained a new joke to harvest
+        # Dynamically harvest jokes
         if "joke" in clean_prompt.lower() and len(reply_text) < 300:
             add_joke(reply_text)
 
@@ -460,6 +496,9 @@ async def on_message(message):
         else:
             for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
                 await message.channel.send(chunk)
+
+    # Trigger rolling summarizer update in the background
+    asyncio.create_task(maybe_update_user_summary(user_id))
 
     await bot.process_commands(message)
 
