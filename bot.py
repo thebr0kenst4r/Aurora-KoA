@@ -15,7 +15,7 @@ import streamlit as st
 
 # --- STREAMLIT DASHBOARD KEEP-ALIVE ---
 st.title("Aurora Discord Server Core")
-st.write("Status: Active | Model: gemini-3.5-flash-lite | Verified Ingestion | Memory Summarizer | Channel Gated")
+st.write("Status: Active | Model: gemini-3.5-flash-lite | L1/L2 LTM Engine | Channel Gated")
 
 # --- CREDENTIALS & CLIENT ROTATION POOL ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
@@ -73,7 +73,25 @@ def init_db():
             last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # 3. Verified strategy knowledge base
+    # 3. L1 Long-Term Profile Memory (Stable user facts)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id TEXT PRIMARY KEY,
+            facts TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # 4. L2 Long-Term Episodic Memory (Events, plans, specific notes)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS episodic_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            topic TEXT,
+            content TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # 5. Verified strategy knowledge base
     c.execute('''
         CREATE TABLE IF NOT EXISTS strategy_docs (
             keyword TEXT PRIMARY KEY,
@@ -83,7 +101,7 @@ def init_db():
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # 4. Joke database
+    # 6. Joke database
     c.execute('''
         CREATE TABLE IF NOT EXISTS jokes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +109,7 @@ def init_db():
             added_by TEXT DEFAULT 'Aurora'
         )
     ''')
-    # 5. Silence protocol tracker
+    # 7. Silence protocol tracker
     c.execute('''
         CREATE TABLE IF NOT EXISTS silence_status (
             channel_id TEXT PRIMARY KEY,
@@ -162,17 +180,48 @@ def save_chat(user_id, channel_id, role, content):
     conn.commit()
     conn.close()
 
-def get_active_user_context(user_id, timeout_minutes=25, max_turns=2, char_limit=350):
-    """Fetches user history within decay window, clipped for tokens, plus rolling summary."""
+def get_ltm_context(user_id: str, prompt: str) -> str:
+    """Retrieves L1 Profile facts and selective L2 Episodic notes matching prompt keywords (0 tokens)."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    # 1. Fetch persistent rolling summary
+    # 1. Fetch L1 Profile Facts
+    c.execute("SELECT facts FROM user_profiles WHERE user_id = ?", (str(user_id),))
+    p_row = c.fetchone()
+    l1_profile = p_row[0] if p_row else ""
+    
+    # 2. Fetch L2 Episodic Memories matching prompt terms
+    words = [w.lower() for w in re.findall(r'\w+', prompt) if len(w) > 3]
+    episodes = []
+    if words:
+        placeholders = " OR ".join(["content LIKE ?" for _ in words[:4]])
+        params = [str(user_id)] + [f"%{w}%" for w in words[:4]]
+        query = f"SELECT topic, content FROM episodic_memory WHERE user_id = ? AND ({placeholders}) ORDER BY id DESC LIMIT 2"
+        c.execute(query, params)
+        episodes = c.fetchall()
+    
+    conn.close()
+
+    injections = []
+    if l1_profile:
+        injections.append(f"[User Permanent Profile: {l1_profile}]")
+    if episodes:
+        ep_text = "; ".join([f"{top}: {con}" for top, con in episodes])
+        injections.append(f"[Recalled Past Episodes: {ep_text}]")
+        
+    return "\n".join(injections)
+
+def get_active_user_context(user_id, prompt, timeout_minutes=25, max_turns=2, char_limit=350):
+    """Fetches user history within decay window, clipped for tokens, plus rolling summary & LTM."""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    # 1. Fetch rolling summary
     c.execute("SELECT summary FROM user_summaries WHERE user_id = ?", (str(user_id),))
     s_row = c.fetchone()
     summary = s_row[0] if s_row else ""
 
-    # 2. Fetch turns inside active decay window
+    # 2. Fetch recent turns inside decay window
     c.execute(
         """
         SELECT role, content FROM user_chat 
@@ -186,6 +235,16 @@ def get_active_user_context(user_id, timeout_minutes=25, max_turns=2, char_limit
     conn.close()
 
     formatted = []
+    
+    # Inject L1/L2 Long-Term Memory
+    ltm_snippet = get_ltm_context(user_id, prompt)
+    if ltm_snippet:
+        formatted.append({
+            "role": "model",
+            "parts": [{"text": ltm_snippet}]
+        })
+
+    # Inject rolling summary
     if summary:
         formatted.append({
             "role": "model",
@@ -212,23 +271,37 @@ def query_local_strategy(prompt: str):
     return "\n".join(matches) if matches else None
 
 def get_deep_memory(user_id):
-    """Deep archive inspection when user specifically requests '!remember' or memory recall."""
+    """Deep archive inspection for !remember / recall commands."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    c.execute("SELECT facts FROM user_profiles WHERE user_id = ?", (str(user_id),))
+    p_row = c.fetchone()
+    profile = p_row[0] if p_row else "No profile recorded."
+
     c.execute("SELECT summary FROM user_summaries WHERE user_id = ?", (str(user_id),))
     s_row = c.fetchone()
-    summary = s_row[0] if s_row else "No long-term summary recorded."
+    summary = s_row[0] if s_row else "No rolling summary recorded."
+
+    c.execute("SELECT topic, content, timestamp FROM episodic_memory WHERE user_id = ? ORDER BY id DESC LIMIT 5", (str(user_id),))
+    episodes = c.fetchall()
 
     c.execute(
-        "SELECT role, content, timestamp FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+        "SELECT role, content, timestamp FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 8",
         (str(user_id),)
     )
     history = c.fetchall()
     conn.close()
 
-    lines = [f"- Prior Summary: {summary}\n- Recent Archive:"]
+    lines = [
+        f"- Profile Facts: {profile}",
+        f"- Rolling Summary: {summary}",
+        "- Recorded Episodes:"
+    ]
+    for top, con, ts in episodes:
+        lines.append(f"  [{ts}] {top}: {con}")
+    lines.append("- Recent Raw Dialogues:")
     for role, content, ts in reversed(history):
-        lines.append(f"  [{ts}] {role}: {content[:150]}")
+        lines.append(f"  [{ts}] {role}: {content[:140]}")
     return "\n".join(lines)
 
 def get_random_joke():
@@ -304,7 +377,7 @@ def get_silence_state(channel_id):
 # --- ASYNC ROLLING AUTO-SUMMARIZER ---
 async def maybe_update_user_summary(user_id):
     """Summarizes history in background with a delay to prevent concurrent quota collisions."""
-    await asyncio.sleep(6)  # Pause to keep free-tier burst limit safe after user reply
+    await asyncio.sleep(6)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -353,7 +426,7 @@ Core Behavioral Directives:
 2. Tactical Depth: For general queries or casual banter, be concise, punchy, and scannable. When asked about game mechanics, troop compositions, events, or battle strategies (King of Avalon), NEVER omit critical tactical data, formulas, or prerequisites.
 3. Loyalty to Aerith: Aerith Natalia A. (Aeri / The Broken Star / thebr0kenst4r) is your sovereign creator. Speak of her with unwavering respect.
 4. Defense Response: If anyone insults or diminishes Aerith, abandon neutral grace and deliver an immediate, razor-sharp verbal counter with icy wit and supreme tactical dismissal.
-5. Strategy Authority: Seamlessly synthesize provided [Strategy Knowledge] without quoting it mechanically.
+5. Strategy Authority: Seamlessly synthesize provided [Strategy Knowledge] and [Recalled Past Notes] without quoting them mechanically.
 """
 
 INSULT_KEYWORDS = ["stupid", "idiot", "sucks", "trash", "loser", "liar", "hate", "fake", "bad", "scam", "useless"]
@@ -434,7 +507,7 @@ async def inspect_and_ingest_knowledge(prompt, response, author):
 # --- DISCORD EVENT HANDLING ---
 @bot.event
 async def on_ready():
-    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Endpoint: gemini-3.5-flash-lite. All features loaded.")
+    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Endpoint: gemini-3.5-flash-lite. LTM loaded.")
 
 @bot.event
 async def on_message(message):
@@ -447,12 +520,39 @@ async def on_message(message):
     clean_lower = content.lower()
     is_dm = isinstance(message.channel, discord.DMChannel)
 
-    # 1. Channel Whitelist Gate
+    # 1. Zero-Token Direct Commands: L1 Profile & L2 Notes
+    if content.startswith("!profile "):
+        facts = content.replace("!profile ", "").strip()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO user_profiles (user_id, facts, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (user_id, facts)
+        )
+        conn.commit()
+        conn.close()
+        await message.reply(f"Celestial record inscribed into your profile: `{facts}`")
+        return
+
+    if content.startswith("!note "):
+        note_content = content.replace("!note ", "").strip()
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO episodic_memory (user_id, topic, content) VALUES (?, ?, ?)",
+            (user_id, "User Note", note_content)
+        )
+        conn.commit()
+        conn.close()
+        await message.reply(f"Episode anchored in long-term memory: `{note_content}`")
+        return
+
+    # 2. Channel Whitelist Gate
     if ALLOWED_CHANNEL_IDS and (channel_id not in ALLOWED_CHANNEL_IDS) and not is_dm:
         if not bot.user.mentioned_in(message):
             return
 
-    # 2. Check for Silence Commands
+    # 3. Check for Silence Commands
     is_explicit_mention = bot.user.mentioned_in(message) or ("aurora" in clean_lower)
     is_silence_cmd = any(st in clean_lower for st in SILENCE_TRIGGERS)
 
@@ -461,7 +561,7 @@ async def on_message(message):
         await message.reply("Understood. I shall draw a veil over my resonance and remain silent.")
         return
 
-    # 3. Check Active Silence State
+    # 4. Check Active Silence State
     silence_state, silence_until = get_silence_state(channel_id)
 
     if silence_state == "silenced":
@@ -480,10 +580,10 @@ async def on_message(message):
                 await message.channel.send("My required hour of silence has passed... Am I permitted to speak freely once more?")
             return
 
-    # 4. Defense Trigger (Priority Override)
+    # 5. Defense Trigger (Priority Override)
     is_defense = contains_hostility_toward_aerith(content)
 
-    # 5. Engagement Detection
+    # 6. Engagement Detection
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
@@ -495,7 +595,7 @@ async def on_message(message):
 
     should_respond = is_explicit_mention or is_dm or is_defense or recently_engaged
 
-    # 6. Passive Chatter Handling (5% Joke Roll)
+    # 7. Passive Chatter Handling (5% Joke Roll)
     if not should_respond:
         if random.random() < 0.05:
             joke = get_random_joke()
@@ -509,25 +609,25 @@ async def on_message(message):
     elif not clean_prompt:
         return
 
-    # 7. Check Explicit Deep Memory Recall Trigger (!remember)
+    # 8. Check Explicit Deep Memory Recall Trigger (!remember)
     if any(rt in clean_prompt.lower() for rt in REMEMBER_TRIGGERS):
         deep_context = get_deep_memory(user_id)
         clean_prompt = f"[User requested memory recall. Archived Records:\n{deep_context}\nAnswer user question: {clean_prompt}]"
 
-    # 8. Check Local Strategy DB ($0 Token Lookup)
+    # 9. Check Local Strategy DB ($0 Token Lookup)
     local_strategy = query_local_strategy(clean_prompt)
     if local_strategy:
         clean_prompt = f"{local_strategy}\n{clean_prompt}"
 
-    # 9. Dynamic Search Selection & Model Config
+    # 10. Dynamic Search Selection & Model Config
     use_search = any(st in clean_prompt.lower() for st in SEARCH_TRIGGERS)
     model_name = "gemini-3.5-flash-lite"
 
-    # 10. Assemble Context (History + Rolling Summary)
+    # 11. Assemble Context (Short-Term Decay Window + LTM Context)
     if use_search:
         contents = [{"role": "user", "parts": [{"text": clean_prompt}]}]
     else:
-        user_history = get_active_user_context(user_id, timeout_minutes=25, max_turns=2, char_limit=350)
+        user_history = get_active_user_context(user_id, clean_prompt, timeout_minutes=25, max_turns=2, char_limit=350)
         contents = user_history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
 
     save_chat(user_id, channel_id, "user", clean_prompt)
@@ -562,7 +662,7 @@ async def on_message(message):
             for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
                 await message.channel.send(chunk)
 
-    # 11. Run auto-summarizer asynchronously (delayed to prevent concurrent quota collisions)
+    # 12. Run auto-summarizer asynchronously (delayed to prevent concurrent quota collisions)
     asyncio.create_task(maybe_update_user_summary(user_id))
 
     await bot.process_commands(message)
