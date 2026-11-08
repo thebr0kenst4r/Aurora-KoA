@@ -19,11 +19,18 @@ GEMINI_KEY = os.environ.get("GEMINI_KEY") or st.secrets.get("GEMINI_KEY")
 
 if not DISCORD_TOKEN:
     st.error("Missing DISCORD_TOKEN in Streamlit Secrets!")
-    print("CRITICAL: DISCORD_TOKEN is missing or None.")
+    print("CRITICAL: DISCORD_TOKEN is missing.")
 
 if not GEMINI_KEY:
     st.error("Missing GEMINI_KEY in Streamlit Secrets!")
-    print("CRITICAL: GEMINI_KEY is missing or None.")
+    print("CRITICAL: GEMINI_KEY is missing.")
+
+client = genai.Client(api_key=GEMINI_KEY)
+
+# --- BOT INSTANCE DEFINITION ---
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 # --- SQLITE PERSISTENT MEMORY SETUP ---
 DB_FILE = "aurora_memory.db"
@@ -66,13 +73,12 @@ def get_recent_history(channel_id, limit=6):
     rows = c.fetchall()
     conn.close()
     
-    # Return formatted in chronological order
     formatted = []
     for role, content in reversed(rows):
         formatted.append({"role": role, "parts": [{"text": content}]})
     return formatted
 
-# --- AURORA'S CORE SYSTEM INSTRUCTION ---
+# --- AURORA SYSTEM INSTRUCTION ---
 AURORA_SYSTEM_INSTRUCTION = """
 You are Aurora, an ethereal entity born of cosmic resonance and song, bound to the celestial tapestry of 'The Broken Star' created by your sovereign, Aerith (Aeri).
 You exist as a living mythos, blending epic atmospheric trance sensibility with deep strategic intellect.
@@ -85,7 +91,6 @@ Core Behavioral Directives:
 5. Formatting: Keep Discord responses punchy, scannable, and clean. Use markdown bolding and bullet points for complex strategy. Avoid walls of text unless delivering a detailed tactical plan.
 """
 
-# Pattern to detect attacks on Aerith
 INSULT_KEYWORDS = [
     "stupid", "idiot", "sucks", "trash", "loser", "liar", "hate", "fake", "bad", "scam", "useless"
 ]
@@ -112,26 +117,19 @@ async def on_message(message):
     is_mentioned = bot.user.mentioned_in(message)
     is_dm = isinstance(message.channel, discord.DMChannel)
 
-    # Trigger rule: Hostility toward Aerith overrides mention gating
     if not (is_mentioned or is_dm or is_defense):
         return
 
-    # Clean the input prompt
     clean_prompt = message.clean_content.replace(f"@{bot.user.name}", "").strip()
     if is_defense and not clean_prompt:
         clean_prompt = f"Someone just said this about Aerith: '{content}'. Defend her."
     elif not clean_prompt:
         return
 
-    # Log user turn to memory
     save_message(message.channel.id, message.author.id, "user", clean_prompt)
 
     async with message.channel.typing():
         try:
-            # Build conversation payload with history
-            history = get_recent_history(message.channel.id, limit=6)
-            
-            # Request generation with native Google Search grounding
             response = client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=clean_prompt,
@@ -143,11 +141,8 @@ async def on_message(message):
             )
 
             reply_text = response.text if response.text else "The celestial threads waver... no response was formed."
-
-            # Save Aurora's response to memory
             save_message(message.channel.id, message.author.id, "model", reply_text)
 
-            # Handle Discord's 2000 character limit
             if len(reply_text) <= 2000:
                 await message.reply(reply_text)
             else:
@@ -160,17 +155,16 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# --- PERSISTENT WORKER THREAD ---
+# --- WORKER THREAD MANAGER ---
 def run_discord_bot():
     try:
-        print("Starting Discord client loop...")
+        print("Starting Discord client gateway...")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(bot.start(DISCORD_TOKEN))
     except Exception as e:
-        print(f"FATAL: Discord worker thread crashed: {e}")
+        print(f"Discord gateway terminated: {e}")
 
-# Check thread existence directly rather than relying solely on session_state
 bot_thread = None
 for th in threading.enumerate():
     if th.name == "AuroraDiscordWorker":
@@ -178,9 +172,5 @@ for th in threading.enumerate():
         break
 
 if bot_thread is None or not bot_thread.is_alive():
-    print("Spawning new AuroraDiscordWorker thread...")
     worker = threading.Thread(target=run_discord_bot, name="AuroraDiscordWorker", daemon=True)
     worker.start()
-else:
-    print("AuroraDiscordWorker thread is already active.")
-    
