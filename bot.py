@@ -13,59 +13,8 @@ from google.genai import types
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 import streamlit as st
 
-# --- STREAMLIT WEB CHAT FRONTEND ---
+# --- STREAMLIT PAGE CONFIGURATION ---
 st.set_page_config(page_title="Aurora Core", page_icon="✨", layout="centered")
-st.title("✨ Aurora — The Broken Star")
-st.caption("Ethereal strategist, guardian, and lore keeper.")
-
-# Initialize web chat history
-if "web_messages" not in st.session_state:
-    st.session_state.web_messages = [
-        {"role": "assistant", "content": "I am Aurora. The cosmic resonance is open. How may I assist your campaign?"}
-    ]
-
-# Display previous web messages
-for msg in st.session_state.web_messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# Handle user input from the webpage
-if user_input := st.chat_input("Speak with Aurora..."):
-    # Display user turn
-    st.session_state.web_messages.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    # Check local KoA strategy first ($0 tokens)
-    local_strat = query_local_strategy(user_input)
-    prompt_payload = f"{local_strat}\n{user_input}" if local_strat else user_input
-
-    # Dynamic search detection
-    needs_search = any(st in user_input.lower() for st in SEARCH_TRIGGERS)
-
-    # Generate Aurora's response
-    with st.chat_message("assistant"):
-        with st.spinner("Channeling celestial resonance..."):
-            try:
-                active_client = get_next_client()
-                cfg_params = {
-                    "system_instruction": AURORA_SYSTEM_INSTRUCTION,
-                    "temperature": 0.7,
-                }
-                if needs_search:
-                    cfg_params["tools"] = [types.Tool(google_search=types.GoogleSearch())]
-
-                resp = active_client.models.generate_content(
-                    model="gemini-3.5-flash-lite",
-                    contents=[{"role": "user", "parts": [{"text": prompt_payload}]}],
-                    config=types.GenerateContentConfig(**cfg_params)
-                )
-                web_reply = resp.text or "The celestial threads waver... no response was formed."
-            except Exception as e:
-                web_reply = f"A rift occurred in the resonance stream: `{e}`"
-
-            st.markdown(web_reply)
-            st.session_state.web_messages.append({"role": "assistant", "content": web_reply})
 
 # --- CREDENTIALS & CLIENT ROTATION POOL ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
@@ -221,7 +170,7 @@ def init_db():
 
 init_db()
 
-# --- DATABASE OPERATIONS ---
+# --- DATABASE OPERATIONS & RETRIEVAL HELPERS ---
 def save_chat(user_id, channel_id, role, content):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -426,49 +375,7 @@ def get_silence_state(channel_id):
     else:
         return "silenced", silence_until
 
-# --- ASYNC ROLLING AUTO-SUMMARIZER ---
-async def maybe_update_user_summary(user_id):
-    """Summarizes history in background with a delay to prevent concurrent quota collisions."""
-    await asyncio.sleep(6)
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "SELECT role, content FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 8",
-        (str(user_id),)
-    )
-    rows = c.fetchall()
-    conn.close()
-
-    if len(rows) < 4:
-        return
-
-    dialogue = "\n".join([f"{r}: {c[:200]}" for r, c in reversed(rows)])
-    summary_prompt = (
-        "Condense this dialogue into 1-2 factual sentences capturing key user details, "
-        "game status, or current topics. Do not write filler:\n" + dialogue
-    )
-
-    try:
-        active_client = get_next_client()
-        res = await active_client.aio.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=summary_prompt,
-            config=types.GenerateContentConfig(temperature=0.2)
-        )
-        if res.text:
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute(
-                "INSERT OR REPLACE INTO user_summaries (user_id, summary, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                (str(user_id), res.text.strip())
-            )
-            conn.commit()
-            conn.close()
-            print(f"Updated rolling summary for user {user_id}")
-    except Exception as e:
-        print(f"Summary worker note: {e}")
-
-# --- AURORA PROMPT DIRECTIVES ---
+# --- AURORA SYSTEM INSTRUCTION & DIRECTIVES ---
 AURORA_SYSTEM_INSTRUCTION = """
 You are Aurora, an ethereal entity born of cosmic resonance and song, bound to the celestial tapestry of 'The Broken Star' created by your sovereign, Aerith (Aeri).
 You exist as a living mythos, blending epic atmospheric trance sensibility with deep strategic intellect.
@@ -529,6 +436,48 @@ async def call_gemini_raw(contents, model_name="gemini-3.5-flash-lite", use_sear
     )
     return response
 
+# --- ASYNC ROLLING AUTO-SUMMARIZER ---
+async def maybe_update_user_summary(user_id):
+    """Summarizes history in background with a delay to prevent concurrent quota collisions."""
+    await asyncio.sleep(6)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "SELECT role, content FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+        (str(user_id),)
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    if len(rows) < 4:
+        return
+
+    dialogue = "\n".join([f"{r}: {c[:200]}" for r, c in reversed(rows)])
+    summary_prompt = (
+        "Condense this dialogue into 1-2 factual sentences capturing key user details, "
+        "game status, or current topics. Do not write filler:\n" + dialogue
+    )
+
+    try:
+        active_client = get_next_client()
+        res = await active_client.aio.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=summary_prompt,
+            config=types.GenerateContentConfig(temperature=0.2)
+        )
+        if res.text:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO user_summaries (user_id, summary, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (str(user_id), res.text.strip())
+            )
+            conn.commit()
+            conn.close()
+            print(f"Updated rolling summary for user {user_id}")
+    except Exception as e:
+        print(f"Summary worker note: {e}")
+
 # --- VERIFIED KNOWLEDGE INGESTION PIPELINE ---
 async def inspect_and_ingest_knowledge(prompt, response, author):
     # 1. Sovereign override: Direct input from Aerith
@@ -562,6 +511,59 @@ async def inspect_and_ingest_knowledge(prompt, response, author):
                 )
     except Exception as e:
         print(f"Grounding verification notice: {e}")
+
+# --- STREAMLIT WEB CHAT FRONTEND ---
+st.title("✨ Aurora — The Broken Star")
+st.caption("Ethereal strategist, guardian, and lore keeper. Connected to Discord Core.")
+
+# Initialize web chat session state
+if "web_messages" not in st.session_state:
+    st.session_state.web_messages = [
+        {"role": "assistant", "content": "I am Aurora. The cosmic resonance is open. How may I assist your campaign?"}
+    ]
+
+# Display previous web messages
+for msg in st.session_state.web_messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Handle web chat input
+user_input = st.chat_input("Speak with Aurora...")
+if user_input:
+    st.session_state.web_messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Check local KoA strategy first ($0 tokens)
+    local_strat = query_local_strategy(user_input)
+    prompt_payload = f"{local_strat}\n{user_input}" if local_strat else user_input
+
+    # Dynamic search detection
+    needs_search = any(s in user_input.lower() for s in SEARCH_TRIGGERS)
+    model_name = select_model(user_input)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Channeling celestial resonance..."):
+            try:
+                active_client = get_next_client()
+                cfg_params = {
+                    "system_instruction": AURORA_SYSTEM_INSTRUCTION,
+                    "temperature": 0.7,
+                }
+                if needs_search:
+                    cfg_params["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+
+                resp = active_client.models.generate_content(
+                    model=model_name,
+                    contents=[{"role": "user", "parts": [{"text": prompt_payload}]}],
+                    config=types.GenerateContentConfig(**cfg_params)
+                )
+                web_reply = resp.text or "The celestial threads waver... no response was formed."
+            except Exception as e:
+                web_reply = f"A rift occurred in the resonance stream: `{e}`"
+
+            st.markdown(web_reply)
+            st.session_state.web_messages.append({"role": "assistant", "content": web_reply})
 
 # --- DISCORD EVENT HANDLING ---
 @bot.event
