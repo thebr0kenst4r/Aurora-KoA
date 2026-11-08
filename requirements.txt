@@ -1,3 +1,5 @@
 discord.py
 google-genai
 streamlit
+tenacity
+duckduckgo_search
