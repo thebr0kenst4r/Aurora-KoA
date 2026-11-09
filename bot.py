@@ -122,38 +122,286 @@ def init_db():
         )
     ''')
 
-    # Seed baseline strategy documents if empty
-    c.execute("SELECT COUNT(*) FROM strategy_docs")
-    if c.fetchone()[0] == 0:
-        c.executemany(
-            "INSERT INTO strategy_docs (keyword, topic, content, verified_by) VALUES (?, ?, ?, ?)",
-            [
-                (
-                    "frost drake",
-                    "Frost Drake Event",
-                    "Frost Drake Priority: Hoard Dragon Flames, Intensifiers, and Drake Essences. Avoid turning in low-tier chests early. Focus on stage multipliers and align point pushes with alliance rally bonuses.",
-                    "Aerith"
-                ),
-                (
-                    "march",
-                    "Troop March Formations",
-                    "Standard Rally & Combat Ratio: Maintain Infantry frontline at 40-50% for defense/absorb, Cavalry at 25-30% for flank burst, and Bowmen at 25-30% for sustained DPS. Never march with naked backlines.",
-                    "Aerith"
-                ),
-                (
-                    "fae",
-                    "Fae Seasons",
-                    "Fae Season Priorities: Prioritize sanctum occupation early for seasonal buffs. Maximize gathering speed nodes in season research trees before pushing combat militarization.",
-                    "Aerith"
-                ),
-                (
-                    "kvk",
-                    "Kingdom vs Kingdom",
-                    "KvK Protocol: Shield active prior to portal opening. Conserve march speed-ups for Coalition Tower battles and royal city rallies. Coordinate defense swarms against incoming rally leaders.",
-                    "Aerith"
-                )
-            ]
+    # Seed / Upsert Comprehensive King of Avalon (Solar) Strategy Matrix
+    EXPANDED_STRATEGY_DOCS = [
+        # --- TROOP & BATTLE FORMATIONS ---
+        (
+            "battle formation",
+            "Battle Formations & Combat Ratios",
+            "Solar Combat Mechanics: Formations dictate target priority and casualty distribution. Standard Rally Ratio: 40-50% Infantry (Shield/frontline damage mitigation), 25-30% Cavalry (flank charge / backline puncture), and 25-30% Bowmen (sustained DPS). Never deploy naked backlines; if Infantry frontline collapses, Bowmen take amplified catastrophic direct damage.",
+            "Aerith"
+        ),
+        (
+            "pvp stats",
+            "PvP Stats, Buffs & Spells",
+            "Prioritize Combat Damage Reduction, Troop Attack, and Health multipliers over basic Defense stats. Active kingdom buffs, war talents, and deity spells should be timed to synchronize with rally impact windows to compound percentage stacking.",
+            "Aerith"
+        ),
+
+        # --- DRAGON & ELDER DRAGON PROGRESSION ---
+        (
+            "dragon",
+            "Dragon Talents & Skills",
+            "Dragon Skill Allocation: Specialize trees strictly into Assault (March Attack/Lethality) or Guardian (Infantry Health/Defense/Damage Taken Reduction) rather than hybrid dispersion. Hoard Dragon Flames, Intensifiers, and Drake Essences for multiplier events.",
+            "Aerith"
+        ),
+        (
+            "dragon awakening",
+            "Dragon Awakening",
+            "Dragon Awakening elevates baseline stat ceiling. Focus awakening stones on your primary troop specialization first before balancing secondary branches.",
+            "Aerith"
+        ),
+        (
+            "elder dragons",
+            "Elder Dragons & Awakening",
+            "Elder Dragons provide passive realm-wide modifiers and combat prowess. Prioritize Elder Dragon Awakening materials during dedicated solar growth cycles to unlock advanced aura buffs.",
+            "Aerith"
+        ),
+
+        # --- EQUIPMENT, HEROES & GEAR ---
+        (
+            "equipment",
+            "Equipment & Gear Enhancement",
+            "Equip complete gear sets to activate set resonance bonuses. Do not mix incomplete tier sets if the higher tier breaks your primary troop attack/defense resonance threshold. Focus enhancement on weapon and armor slots first.",
+            "Aerith"
+        ),
+        (
+            "gemstones",
+            "Gemstones & Inlay Strategy",
+            "Inlay gemstones aligned strictly with your primary rally focus (Infantry Health/Defense gems for tanks; Cav/Bow Attack and Lethality gems for damage). Refine low-tier gems in batches during spend/consume milestone events.",
+            "Aerith"
+        ),
+        (
+            "hero weapons",
+            "Hero Weapons & Specialization",
+            "Hero weapons significantly bolster hero council skill efficiency. Prioritize exclusive hero weapons matching your council leaders to trigger high-tier combat skill effects.",
+            "Aerith"
+        ),
+        (
+            "heroes",
+            "Hero Council & Appointees",
+            "Appoint heroes based on specific march utility and council passive synergies. Match front-row tank heroes with defensive council slots and offensive backline commanders with attack slots to maximize march scaling.",
+            "Aerith"
+        ),
+        (
+            "relics",
+            "Relics & Lost Relics",
+            "Lost Relics and permanent relics provide realm-wide passive multipliers. Target relics granting march capacity expansion, rally size boosts, and enemy troop debuffs.",
+            "Aerith"
+        ),
+        (
+            "artifacts",
+            "Artifacts & Enhancement",
+            "Enhance core artifacts that amplify troop lethality and damage received reduction. Ensure artifact power tracks with your current equipment tier.",
+            "Aerith"
+        ),
+        (
+            "emblems",
+            "Emblems & Crests",
+            "Socket emblems uniformly across equipment slots to unlock global tier perks. Focus on flat troop reduction and percentage attack boosts.",
+            "Aerith"
+        ),
+
+        # --- DEITIES, BOONS & SPIRITUAL SYSTEMS ---
+        (
+            "deity",
+            "Deity Systems & Devotion",
+            "Deity shrines offer passive kingdom protections and offensive activation buffs. Maximize devotion tiers during growth stages to sustain combat aura efficiency.",
+            "Aerith"
+        ),
+        (
+            "divine boon",
+            "Divine Boon & Favor",
+            "Balance Divine Boon activation prior to major kingdom invasions or Coalition rallies. Divine Favor buffs compound directly with equipment stats.",
+            "Aerith"
+        ),
+        (
+            "mystic soul",
+            "Mystic Souls & Resonance",
+            "Infuse mystic souls to augment individual troop type vitality and lethality. Prioritize frontline survivability souls before investment into pure damage branches.",
+            "Aerith"
+        ),
+        (
+            "element rating",
+            "Element Rating & Counters",
+            "Element ratings introduce cyclic advantage mechanics. Study defending enemy element affixes before engaging to ensure counter bonuses are leveraged.",
+            "Aerith"
+        ),
+
+        # --- BASE, REALM & DOMINION GROWTH ---
+        (
+            "castle",
+            "Castle & Building Priorities",
+            "Prioritize Stronghold rush milestones to unlock higher troop tiers (T10, T11, T12). Always keep Embassy, Hall of War, and Resource production buildings synchronized with core march caps.",
+            "Aerith"
+        ),
+        (
+            "solars evolution",
+            "Solar Evolution & Growth",
+            "Focus evolution trees on march capacity, training speed, and hospital capacity before luxury economic nodes. Hospital capacity must always exceed your largest single-march deployment.",
+            "Aerith"
+        ),
+        (
+            "beastling",
+            "Beastling Realm",
+            "Nurture and evolve beastlings to gain passive march speed, gathering acceleration, and auxiliary combat stats.",
+            "Aerith"
+        ),
+        (
+            "skyloft",
+            "Skyloft Garden",
+            "Tend Skyloft crops and flora on rotation to generate vital stat essences and temporary march vigor buffs.",
+            "Aerith"
+        ),
+        (
+            "banners",
+            "Alliance & War Banners",
+            "Place war banners strategically near contested Coalition structures or resource veins to expand territory buffs and reinforce rally speed.",
+            "Aerith"
+        ),
+
+        # --- ALLIANCE & COALITION EVENTS ---
+        (
+            "alliance",
+            "Alliance Coordination & Warfare",
+            "Alliance unity is paramount. Keep reinforcements routed to frontline towers, maintain high donation levels for alliance tech milestones, and coordinate rally leader queues in advance.",
+            "Aerith"
+        ),
+        (
+            "alliance hunt",
+            "Alliance Hunt & Treasure Hunt",
+            "Coordinate rally calls during scheduled hunt hours. Maximize stamina replenishment items specifically when alliance drop multipliers are active.",
+            "Aerith"
+        ),
+        (
+            "fallen knights",
+            "Fallen Knights Event",
+            "Fallen Knights Protocol: Reinforce weaker alliance castles that cannot survive higher waves. Higher-power players should send spare defense marches out to maximize overall alliance survival points.",
+            "Aerith"
+        ),
+        (
+            "guardian challenge",
+            "Guardian Challenge",
+            "Deploy maximum sustained DPS march configurations against the Guardian. Rotate defense debuff heroes first before high-burst strikes.",
+            "Aerith"
+        ),
+
+        # --- WAR, INVASION & REALM-WIDE EVENTS ---
+        (
+            "excalibur",
+            "Excalibur Invasion",
+            "Royal Excalibur Warfare: Synchronize Coalition rallies against the royal palace and sanity towers. Coordinate march speeds so rally impacts hit concurrently with swarm defense waves.",
+            "Aerith"
+        ),
+        (
+            "fae",
+            "Fae Realm & Seasons",
+            "Fae Realm Protocol: Secure sanctum occupations early for seasonal kingdom buffs. Focus seasonal research trees on gathering and processing speed nodes before combat militarization.",
+            "Aerith"
+        ),
+        (
+            "mystery of the dunes",
+            "Mystery of the Dunes (Fae Season 7)",
+            "Dunes Season Mechanics: Prioritize water and oasis capture points to stave off territorial attrition. Protect supply lines between occupied sanctums.",
+            "Aerith"
+        ),
+        (
+            "netherwar",
+            "Nether War & Netherfall",
+            "Nether Battlefield Strategy: Control portal checkpoints and capture central spires. Rapid repositioning and march speed-ups are crucial to contest point capture nodes.",
+            "Aerith"
+        ),
+        (
+            "uac",
+            "Ultimate Alliance Conquest (UAC)",
+            "UAC Tournament Operations: Strict comms discipline. Assign dedicated rally leads, fast-cavalry capture runners for unoccupied buildings, and anchor defense teams at core control towers.",
+            "Aerith"
+        ),
+        (
+            "kingdom tourney",
+            "Kingdom Tourney & Raids",
+            "Gold Event & Kingdom Raid: Keep shields active prior to portal readiness. Target unshielded resource-heavy castles and retreat troops before counter-swarms land.",
+            "Aerith"
+        ),
+        (
+            "spire",
+            "Spire & Floor Progression",
+            "Spire Tactics: Tailor troop compositions directly to counter the enemy formation displayed on each floor. Reset and adjust hero council alignments to counter specific boss immunities.",
+            "Aerith"
+        ),
+        (
+            "shadow planes",
+            "Shadow Planes",
+            "Shadow Planes expedition: Conserve stamina for elite shadow fiends. Clear floor stages systematically to gather high-tier artifact and gear upgrade catalysts.",
+            "Aerith"
+        ),
+        (
+            "antiquity tree",
+            "Antiquity Tree Challenge",
+            "Antiquity Tree: Clear branch nodes methodically. Reallocate talent points toward PvE monster damage and stamina recovery to maximize stage depth.",
+            "Aerith"
+        ),
+        (
+            "dragon dale",
+            "Dragon Dale Clash",
+            "Dale Clash: Secure mineral nodes and control central dragon sanctuaries. Defense swarms must be coordinated quickly against enemy rally leads.",
+            "Aerith"
+        ),
+        (
+            "dragonfire relay",
+            "Dragonfire Relay",
+            "Relay Strategy: Maintain uninterrupted torch transit across designated waypoints. Position escort marches along the transit lane to block intercepts.",
+            "Aerith"
+        ),
+        (
+            "ravager hunt",
+            "Ravager Hunt",
+            "Ravager Hunt: Pool alliance march stamina to burn down high-level ravagers during double-point bonus hours.",
+            "Aerith"
+        ),
+        (
+            "castle conquest",
+            "Castle Conquest",
+            "Conquest Strategy: Isolate and surround target objectives. Suppress incoming defensive reinforcements using staggered diversion marches.",
+            "Aerith"
+        ),
+        (
+            "path of conquest",
+            "Path of Conquest",
+            "Progression road: Fulfill daily milestone objectives to accumulate march speed-ups and enhancement crystals for seasonal milestones.",
+            "Aerith"
+        ),
+        (
+            "infinite realms",
+            "Infinite Realms Dragon King",
+            "Infinite Realms Warfare: Cross-realm deployment requires strict scouting. Never commit main rallies without confirming enemy reinforcement capacity.",
+            "Aerith"
+        ),
+        (
+            "knight of the lake",
+            "Knight of the Lake",
+            "Lake Trials: Deploy high-defense frontline marches to weather the Knight's initial burst phase, then follow up with high-lethality archer DPS.",
+            "Aerith"
+        ),
+        (
+            "scouting",
+            "Scouting & Reconnaissance",
+            "Scouting Protocol: Never attack blind. Thorough recon reveals enemy wall defenses, reinforcing garrisons, hero council setups, and hidden trap counts.",
+            "Aerith"
+        ),
+        (
+            "migration",
+            "Kingdom Merge & Migration",
+            "Migration Strategy: Ensure your resource totals are below vault protection thresholds or spent on research before migrating. Collect required migration passes during event discounts.",
+            "Aerith"
         )
+    ]
+
+    c.executemany(
+        "INSERT OR REPLACE INTO strategy_docs (keyword, topic, content, verified_by, timestamp) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        EXPANDED_STRATEGY_DOCS
+    )
+
 
     # Seed baseline jokes
     c.execute("SELECT COUNT(*) FROM jokes")
