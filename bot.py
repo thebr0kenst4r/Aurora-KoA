@@ -511,36 +511,74 @@ async def inspect_and_ingest_knowledge(prompt, response, author):
                 )
     except Exception as e:
         print(f"Grounding verification notice: {e}")
-
+        
 # --- STREAMLIT WEB CHAT FRONTEND ---
 st.title("✨ Aurora — The Broken Star")
 st.caption("Ethereal strategist, guardian, and lore keeper. Connected to Discord Core.")
 
-# Initialize web chat session state
+# 1. Initialize session authentication states
+if "is_aerith_authenticated" not in st.session_state:
+    st.session_state.is_aerith_authenticated = False
+
 if "web_messages" not in st.session_state:
     st.session_state.web_messages = [
         {"role": "assistant", "content": "I am Aurora. The cosmic resonance is open. How may I assist your campaign?"}
     ]
 
-# Display previous web messages
+# 2. Sidebar Authentication & Passcode Verification
+EXPECTED_KEY = os.environ.get("AERITH_KEY") or st.secrets.get("AERITH_KEY", "cosmic_resonance_key")
+
+with st.sidebar:
+    st.subheader("Identity & Resonance")
+    
+    if not st.session_state.is_aerith_authenticated:
+        st.info("Browsing as Guest")
+        entered_pass = st.text_input("Enter Sovereign Key:", type="password")
+        if st.button("Authenticate"):
+            if entered_pass == EXPECTED_KEY:
+                st.session_state.is_aerith_authenticated = True
+                st.rerun()
+            else:
+                st.error("Resonance mismatch. Access denied.")
+    else:
+        st.success("👑 Sovereign Recognized: Aerith")
+        st.caption("Verified for this browser session only.")
+        if st.button("Seal Resonance (Log Out)"):
+            st.session_state.is_aerith_authenticated = False
+            st.rerun()
+
+# 3. Render previous conversation turns
 for msg in st.session_state.web_messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Handle web chat input
-user_input = st.chat_input("Speak with Aurora...")
-if user_input:
+# 4. Handle web input
+if user_input := st.chat_input("Speak with Aurora..."):
     st.session_state.web_messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
+
+    # 5. Protected Strategy / Knowledge Ingestion
+    # Only triggered if the session is verified with the secret passcode
+    is_authenticated = st.session_state.is_aerith_authenticated
+    strat_triggers = ["guide", "mechanic", "strategy", "formula", "fae", "event", "tactic"]
+    
+    if is_authenticated and any(k in user_input.lower() for k in strat_triggers):
+        topic_key = user_input.replace("guide", "").replace("strategy", "").strip()[:30]
+        add_verified_strategy(topic_key, topic_key, user_input, "Aerith (Web Direct)")
+        st.toast(f"✨ Inscribed into Permanent Strategy Records: {topic_key}")
 
     # Check local KoA strategy first ($0 tokens)
     local_strat = query_local_strategy(user_input)
     prompt_payload = f"{local_strat}\n{user_input}" if local_strat else user_input
 
-    # Dynamic search detection
+    # Dynamic search triggers & model selection
     needs_search = any(s in user_input.lower() for s in SEARCH_TRIGGERS)
     model_name = select_model(user_input)
+
+    # Sovereign tone injection if authenticated
+    if is_authenticated:
+        prompt_payload = f"[Speaking directly to your Sovereign Creator, Aerith]:\n{prompt_payload}"
 
     with st.chat_message("assistant"):
         with st.spinner("Channeling celestial resonance..."):
