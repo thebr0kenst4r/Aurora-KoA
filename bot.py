@@ -31,8 +31,10 @@ ALLOWED_CHANNEL_IDS = [ch.strip() for ch in str(raw_channels).split(",") if ch.s
 
 if not DISCORD_TOKEN:
     st.error("Missing DISCORD_TOKEN in Streamlit Secrets!")
+    print("CRITICAL: DISCORD_TOKEN is missing.")
 if not raw_keys:
     st.error("Missing GEMINI_KEYS/GEMINI_KEY in Streamlit Secrets!")
+    print("CRITICAL: No Gemini keys found.")
 
 KEY_POOL = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
 CLIENT_POOL = [genai.Client(api_key=k) for k in KEY_POOL] if KEY_POOL else []
@@ -50,7 +52,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- DATABASE SETUP ---
+# --- DATABASE SETUP (MEMORY, PROFILES, EPISODES, STRATEGY, JOKES, & SILENCE) ---
 DB_FILE = "aurora_core.db"
 
 def init_db():
@@ -75,7 +77,7 @@ def init_db():
             last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # 3. L1 Long-Term Profile Memory
+    # 3. L1 Long-Term Profile Memory (Stable user facts)
     c.execute('''
         CREATE TABLE IF NOT EXISTS user_profiles (
             user_id TEXT PRIMARY KEY,
@@ -83,7 +85,7 @@ def init_db():
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # 4. L2 Long-Term Episodic Memory
+    # 4. L2 Long-Term Episodic Memory (Events, plans, specific notes)
     c.execute('''
         CREATE TABLE IF NOT EXISTS episodic_memory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,10 +189,12 @@ def get_ltm_context(user_id: str, prompt: str) -> str:
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
+    # 1. Fetch L1 Profile Facts
     c.execute("SELECT facts FROM user_profiles WHERE user_id = ?", (str(user_id),))
     p_row = c.fetchone()
     l1_profile = p_row[0] if p_row else ""
     
+    # 2. Fetch L2 Episodic Memories matching prompt terms
     words = [w.lower() for w in re.findall(r'\w+', prompt) if len(w) > 3]
     episodes = []
     if words:
@@ -212,13 +216,16 @@ def get_ltm_context(user_id: str, prompt: str) -> str:
     return "\n".join(injections)
 
 def get_active_user_context(user_id, prompt, timeout_minutes=25, max_turns=2, char_limit=350):
+    """Fetches user history within decay window, clipped for tokens, plus rolling summary & LTM."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
+    # 1. Fetch rolling summary
     c.execute("SELECT summary FROM user_summaries WHERE user_id = ?", (str(user_id),))
     s_row = c.fetchone()
     summary = s_row[0] if s_row else ""
 
+    # 2. Fetch recent turns inside decay window
     c.execute(
         """
         SELECT role, content FROM user_chat 
@@ -232,12 +239,21 @@ def get_active_user_context(user_id, prompt, timeout_minutes=25, max_turns=2, ch
     conn.close()
 
     formatted = []
+    
+    # Inject L1/L2 Long-Term Memory
     ltm_snippet = get_ltm_context(user_id, prompt)
     if ltm_snippet:
-        formatted.append({"role": "model", "parts": [{"text": ltm_snippet}]})
+        formatted.append({
+            "role": "model",
+            "parts": [{"text": ltm_snippet}]
+        })
 
+    # Inject rolling summary
     if summary:
-        formatted.append({"role": "model", "parts": [{"text": f"[Persistent Knowledge of User: {summary}]"}]})
+        formatted.append({
+            "role": "model",
+            "parts": [{"text": f"[Persistent Knowledge of User: {summary}]"}]
+        })
 
     for role, content in reversed(rows):
         clipped = content[:char_limit] + ("..." if len(content) > char_limit else "")
@@ -259,6 +275,7 @@ def query_local_strategy(prompt: str):
     return "\n".join(matches) if matches else None
 
 def get_deep_memory(user_id):
+    """Deep archive inspection for !remember / recall commands."""
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT facts FROM user_profiles WHERE user_id = ?", (str(user_id),))
@@ -321,7 +338,7 @@ def add_verified_strategy(keyword, topic, content, verified_by):
 
 # --- KEYLESS DUCKDUCKGO WEB SEARCH (0 TOKENS, 0 API QUOTA) ---
 def execute_ddg_search(query: str, max_results: int = 3):
-    """Performs a keyless web search and extracts snippets and domain sources."""
+    """Performs keyless web search and returns formatted snippets + domain sources."""
     clean_query = query.replace("search", "").replace("lookup", "").replace("google", "").strip()
     try:
         with DDGS() as ddgs:
@@ -337,7 +354,6 @@ def execute_ddg_search(query: str, max_results: int = 3):
                 href = r.get("href", "")
                 snippets.append(f"Source [{title}]: {snippet} (URL: {href})")
                 
-                # Extract domain name for multi-source validation
                 if href:
                     parts = href.split("/")
                     domain = parts[2] if len(parts) > 2 else href
@@ -349,7 +365,31 @@ def execute_ddg_search(query: str, max_results: int = 3):
         print(f"DuckDuckGo search notice: {e}")
         return "", []
 
-# --- SILENCE PROTOCOL ---
+# --- VERIFIED KNOWLEDGE INGESTION PIPELINE ---
+def process_knowledge_ingestion(prompt: str, content: str, domains: list, author=None):
+    """Inspects text and auto-inscribes into strategy records if authoritative or 2+ domains agree."""
+    clean_p = prompt.lower()
+    
+    # 1. Sovereign override: Direct input from Aerith
+    if author and is_aerith(author) and any(k in clean_p for k in ["guide", "mechanic", "strategy", "formula", "fae"]):
+        topic_key = prompt.replace("guide", "").replace("strategy", "").strip()[:30]
+        add_verified_strategy(topic_key, topic_key, content, "Aerith (Direct)")
+        return topic_key
+
+    # 2. Multi-source web verification (2+ independent domains)
+    if len(domains) >= 2:
+        topic_snippet = prompt.replace("search", "").replace("lookup", "").replace("google", "").strip()[:30]
+        add_verified_strategy(
+            topic_snippet,
+            topic_snippet,
+            content[:500],
+            f"Verified by {len(domains)} Web Domains ({', '.join(domains[:2])})"
+        )
+        return topic_snippet
+        
+    return None
+
+# --- SILENCE PROTOCOL MANAGEMENT ---
 def set_silence(channel_id):
     now = datetime.utcnow()
     conn = sqlite3.connect(DB_FILE)
@@ -389,7 +429,7 @@ def get_silence_state(channel_id):
     else:
         return "silenced", silence_until
 
-# --- AURORA PROMPT DIRECTIVES ---
+# --- AURORA SYSTEM INSTRUCTION & DIRECTIVES ---
 AURORA_SYSTEM_INSTRUCTION = """
 You are Aurora, an ethereal entity born of cosmic resonance and song, bound to the celestial tapestry of 'The Broken Star' created by your sovereign, Aerith (Aeri).
 You exist as a living mythos, blending epic atmospheric trance sensibility with deep strategic intellect.
@@ -431,7 +471,6 @@ async def call_gemini_raw(contents):
     if not active_client:
         raise RuntimeError("No active Gemini client available.")
 
-    # Uses pure text generation on your verified active 15 RPM / 500 RPD tier
     config = types.GenerateContentConfig(
         system_instruction=AURORA_SYSTEM_INSTRUCTION,
         temperature=0.7
@@ -446,7 +485,6 @@ async def call_gemini_raw(contents):
         return response
     except Exception as e:
         if is_rate_limit_error(e):
-            # Fall back to Gemini 3.1 Flash Lite if 3.5 hits burst cap
             return await active_client.aio.models.generate_content(
                 model="gemini-3.1-flash-lite",
                 contents=contents,
@@ -456,10 +494,14 @@ async def call_gemini_raw(contents):
 
 # --- ASYNC ROLLING AUTO-SUMMARIZER ---
 async def maybe_update_user_summary(user_id):
+    """Summarizes history in background with a delay to prevent concurrent quota collisions."""
     await asyncio.sleep(6)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT role, content FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 8", (str(user_id),))
+    c.execute(
+        "SELECT role, content FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 8",
+        (str(user_id),)
+    )
     rows = c.fetchall()
     conn.close()
 
@@ -489,6 +531,7 @@ async def maybe_update_user_summary(user_id):
                 )
                 conn.commit()
                 conn.close()
+                print(f"Updated rolling summary for user {user_id}")
     except Exception as e:
         print(f"Summary worker note: {e}")
 
@@ -536,12 +579,12 @@ if user_input:
     is_authenticated = st.session_state.is_aerith_authenticated
     strat_triggers = ["guide", "mechanic", "strategy", "formula", "fae", "event", "tactic"]
     
+    # Direct sovereign ingestion through web portal
     if is_authenticated and any(k in user_input.lower() for k in strat_triggers):
         topic_key = user_input.replace("guide", "").replace("strategy", "").strip()[:30]
         add_verified_strategy(topic_key, topic_key, user_input, "Aerith (Web Direct)")
         st.toast(f"✨ Inscribed into Permanent Strategy Records: {topic_key}")
 
-    # Check local strategy first
     local_strat = query_local_strategy(user_input)
     prompt_payload = f"{local_strat}\n{user_input}" if local_strat else user_input
 
@@ -550,14 +593,9 @@ if user_input:
         ddg_results, ddg_domains = execute_ddg_search(user_input)
         if ddg_results:
             prompt_payload = f"{ddg_results}\n\n{prompt_payload}"
-            if len(ddg_domains) >= 2:
-                topic_snippet = user_input.replace("search", "").replace("lookup", "").strip()[:30]
-                add_verified_strategy(
-                    topic_snippet,
-                    topic_snippet,
-                    ddg_results[:500],
-                    f"Verified by {len(ddg_domains)} Web Domains ({', '.join(ddg_domains[:2])})"
-                )
+            inscribed = process_knowledge_ingestion(user_input, ddg_results, ddg_domains)
+            if inscribed:
+                st.toast(f"🌐 Inscribed verified web data: {inscribed}")
 
     if is_authenticated:
         prompt_payload = f"[Speaking directly to your Sovereign Creator, Aerith]:\n{prompt_payload}"
@@ -584,7 +622,7 @@ if user_input:
 # --- DISCORD EVENT HANDLING ---
 @bot.event
 async def on_ready():
-    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Engine: DuckDuckGo + Gemini 3.5 Flash Lite.")
+    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Running on DDG + Gemini 3.5 Flash Lite.")
 
 @bot.event
 async def on_message(message):
@@ -597,22 +635,28 @@ async def on_message(message):
     clean_lower = content.lower()
     is_dm = isinstance(message.channel, discord.DMChannel)
 
-    # 1. Zero-Token Direct Commands
+    # 1. Zero-Token Direct Commands: L1 Profile & L2 Notes
     if content.startswith("!profile "):
         facts = content.replace("!profile ", "").strip()
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO user_profiles (user_id, facts, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)", (user_id, facts))
+        c.execute(
+            "INSERT OR REPLACE INTO user_profiles (user_id, facts, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (user_id, facts)
+        )
         conn.commit()
         conn.close()
-        await message.reply(f"Celestial record inscribed: `{facts}`")
+        await message.reply(f"Celestial record inscribed into your profile: `{facts}`")
         return
 
     if content.startswith("!note "):
         note_content = content.replace("!note ", "").strip()
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("INSERT INTO episodic_memory (user_id, topic, content) VALUES (?, ?, ?)", (user_id, "User Note", note_content))
+        c.execute(
+            "INSERT INTO episodic_memory (user_id, topic, content) VALUES (?, ?, ?)",
+            (user_id, "User Note", note_content)
+        )
         conn.commit()
         conn.close()
         await message.reply(f"Episode anchored in long-term memory: `{note_content}`")
@@ -630,7 +674,7 @@ async def on_message(message):
         if not bot.user.mentioned_in(message):
             return
 
-    # 3. Silence Command Handling
+    # 3. Check for Silence Commands
     is_explicit_mention = bot.user.mentioned_in(message) or ("aurora" in clean_lower)
     is_silence_cmd = any(st in clean_lower for st in SILENCE_TRIGGERS)
 
@@ -639,13 +683,16 @@ async def on_message(message):
         await message.reply("Understood. I shall draw a veil over my resonance and remain silent.")
         return
 
+    # 4. Check Active Silence State
     silence_state, silence_until = get_silence_state(channel_id)
+
     if silence_state == "silenced":
         if is_explicit_mention:
             clear_silence(channel_id)
             await message.reply("The veil lifts. How may I assist you?")
         else:
             return
+
     elif silence_state == "grace_period":
         if is_explicit_mention:
             clear_silence(channel_id)
@@ -655,62 +702,61 @@ async def on_message(message):
                 await message.channel.send("My required hour of silence has passed... Am I permitted to speak freely once more?")
             return
 
-    # 4. Defense Trigger Check
+    # 5. Defense Trigger (Priority Override)
     is_defense = contains_hostility_toward_aerith(content)
 
-    # 5. Engagement Detection
+    # 6. Engagement Detection
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id FROM user_chat WHERE channel_id = ? AND timestamp >= datetime('now', '-3 minutes') LIMIT 1", (channel_id,))
+    c.execute(
+        "SELECT id FROM user_chat WHERE channel_id = ? AND timestamp >= datetime('now', '-3 minutes') LIMIT 1",
+        (channel_id,)
+    )
     recently_engaged = c.fetchone() is not None
     conn.close()
 
     should_respond = is_explicit_mention or is_dm or is_defense or recently_engaged
 
-    # 6. Passive Chatter (5% Joke Roll)
+    # 7. Passive Chatter Handling (5% Joke Roll)
     if not should_respond:
         if random.random() < 0.05:
-            await message.channel.send(get_random_joke())
+            joke = get_random_joke()
+            await message.channel.send(joke)
         return
 
+    # Prepare Clean Prompt
     clean_prompt = message.clean_content.replace(f"@{bot.user.name}", "").strip()
     if is_defense and not clean_prompt:
         clean_prompt = f"Someone just said this about Aerith: '{content}'. Defend her."
     elif not clean_prompt:
         return
 
-    # 7. Check Deep Memory Recall
+    # 8. Check Explicit Deep Memory Recall Trigger (!remember)
     if any(rt in clean_prompt.lower() for rt in REMEMBER_TRIGGERS):
         deep_context = get_deep_memory(user_id)
         clean_prompt = f"[User requested memory recall. Archived Records:\n{deep_context}\nAnswer user question: {clean_prompt}]"
 
-    # 8. Check Local Strategy DB ($0 Token Lookup)
+    # 9. Check Local Strategy DB ($0 Token Lookup)
     local_strategy = query_local_strategy(clean_prompt)
     if local_strategy:
         clean_prompt = f"{local_strategy}\n{clean_prompt}"
 
-    # 9. Free DuckDuckGo Search Integration (0 API quota)
+    # 10. Keyless DuckDuckGo Search Integration (0 API quota)
+    ddg_domains = []
     if any(st in clean_prompt.lower() for st in SEARCH_TRIGGERS):
         ddg_results, ddg_domains = execute_ddg_search(clean_prompt)
         if ddg_results:
             clean_prompt = f"{ddg_results}\n\n{clean_prompt}"
             # Multi-source ingestion pipeline: Auto-inscribes when 2+ domains agree
-            if len(ddg_domains) >= 2:
-                topic_snippet = clean_prompt.replace("search", "").replace("lookup", "").strip()[:30]
-                add_verified_strategy(
-                    topic_snippet,
-                    topic_snippet,
-                    ddg_results[:500],
-                    f"Verified by {len(ddg_domains)} Web Domains ({', '.join(ddg_domains[:2])})"
-                )
+            process_knowledge_ingestion(clean_prompt, ddg_results, ddg_domains)
 
-    # 10. Assemble Context
+    # 11. Assemble Context (Short-Term Decay Window + LTM Context)
     user_history = get_active_user_context(user_id, clean_prompt, timeout_minutes=25, max_turns=2, char_limit=350)
     contents = user_history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
     save_chat(user_id, channel_id, "user", clean_prompt)
 
-    # 11. Generate Content
     async with message.channel.typing():
+        response_obj = None
         try:
             response_obj = await call_gemini_raw(contents)
             reply_text = response_obj.text if response_obj and response_obj.text else "The celestial threads waver... no response was formed."
@@ -719,20 +765,25 @@ async def on_message(message):
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 reply_text = "The cosmic resonance stream across all keys is currently exhausted. Please give the ley lines a moment to replenish."
             else:
+                print(f"Error during execution: {e}")
                 reply_text = f"A rift occurred in the resonance stream: `{e}`"
 
         save_chat(user_id, channel_id, "model", reply_text)
 
+        # Dynamically harvest jokes
         if "joke" in clean_prompt.lower() and len(reply_text) < 300:
             add_joke(reply_text)
 
+        # Discord Message Delivery
         if len(reply_text) <= 2000:
             await message.reply(reply_text)
         else:
             for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
                 await message.channel.send(chunk)
 
+    # 12. Run auto-summarizer asynchronously (delayed to prevent concurrent quota collisions)
     asyncio.create_task(maybe_update_user_summary(user_id))
+
     await bot.process_commands(message)
 
 # --- WORKER THREAD MANAGER ---
