@@ -13,7 +13,7 @@ from google.genai import types
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 import streamlit as st
 
-# --- STREAMLIT PAGE CONFIGURATION ---
+# --- STREAMLIT DASHBOARD CONFIGURATION ---
 st.set_page_config(page_title="Aurora Core", page_icon="✨", layout="centered")
 
 # --- CREDENTIALS & CLIENT ROTATION POOL ---
@@ -37,11 +37,13 @@ if not raw_keys:
 
 KEY_POOL = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
 CLIENT_POOL = [genai.Client(api_key=k) for k in KEY_POOL]
-client_cycle = itertools.cycle(CLIENT_POOL)
+client_cycle = itertools.cycle(CLIENT_POOL) if CLIENT_POOL else None
 client_lock = threading.Lock()
 
 def get_next_client():
     with client_lock:
+        if not client_cycle:
+            return None
         return next(client_cycle)
 
 # --- BOT DEFINITION ---
@@ -403,10 +405,13 @@ def contains_hostility_toward_aerith(text):
     clean = text.lower()
     return any(name in clean for name in AERITH_IDENTIFIERS) and any(bad in clean for bad in INSULT_KEYWORDS)
 
-def select_model(prompt: str) -> str:
-    clean = prompt.lower()
-    if any(trigger in clean for trigger in ADVANCED_TRIGGERS):
-        return "gemini-3.8-pro"
+def select_model(prompt: str, use_search: bool = False) -> str:
+    """
+    Reroutes Search grounding to gemini-2.5-flash which holds active grounding support.
+    Conversational prompts route to gemini-3.5-flash-lite (15 RPM / 500 RPD).
+    """
+    if use_search:
+        return "gemini-2.5-flash"
     return "gemini-3.5-flash-lite"
 
 def is_rate_limit_error(exception):
@@ -421,20 +426,41 @@ def is_rate_limit_error(exception):
 )
 async def call_gemini_raw(contents, model_name="gemini-3.5-flash-lite", use_search=False):
     active_client = get_next_client()
+    if not active_client:
+        raise RuntimeError("No Gemini API clients initialized.")
+
     config_params = {
         "system_instruction": AURORA_SYSTEM_INSTRUCTION,
         "temperature": 0.7,
     }
+    
+    # Grounding is attached only to the supported model
     if use_search:
         config_params["tools"] = [types.Tool(google_search=types.GoogleSearch())]
         
     config = types.GenerateContentConfig(**config_params)
-    response = await active_client.aio.models.generate_content(
-        model=model_name,
-        contents=contents,
-        config=config
-    )
-    return response
+    
+    try:
+        response = await active_client.aio.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=config
+        )
+        return response
+    except Exception as e:
+        # Graceful fallback: If search hits a rate limit, retry query on 3.5 without tool
+        if is_rate_limit_error(e) and use_search:
+            print("Grounding quota hit. Falling back to internal knowledge on gemini-3.5-flash-lite.")
+            fallback_config = types.GenerateContentConfig(
+                system_instruction=AURORA_SYSTEM_INSTRUCTION,
+                temperature=0.7
+            )
+            return await active_client.aio.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=contents,
+                config=fallback_config
+            )
+        raise e
 
 # --- ASYNC ROLLING AUTO-SUMMARIZER ---
 async def maybe_update_user_summary(user_id):
@@ -460,28 +486,29 @@ async def maybe_update_user_summary(user_id):
 
     try:
         active_client = get_next_client()
-        res = await active_client.aio.models.generate_content(
-            model="gemini-3.5-flash-lite",
-            contents=summary_prompt,
-            config=types.GenerateContentConfig(temperature=0.2)
-        )
-        if res.text:
-            conn = sqlite3.connect(DB_FILE)
-            c = conn.cursor()
-            c.execute(
-                "INSERT OR REPLACE INTO user_summaries (user_id, summary, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                (str(user_id), res.text.strip())
+        if active_client:
+            res = await active_client.aio.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=summary_prompt,
+                config=types.GenerateContentConfig(temperature=0.2)
             )
-            conn.commit()
-            conn.close()
-            print(f"Updated rolling summary for user {user_id}")
+            if res.text:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute(
+                    "INSERT OR REPLACE INTO user_summaries (user_id, summary, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                    (str(user_id), res.text.strip())
+                )
+                conn.commit()
+                conn.close()
+                print(f"Updated rolling summary for user {user_id}")
     except Exception as e:
         print(f"Summary worker note: {e}")
 
 # --- VERIFIED KNOWLEDGE INGESTION PIPELINE ---
 async def inspect_and_ingest_knowledge(prompt, response, author):
     # 1. Sovereign override: Direct input from Aerith
-    if is_aerith(author) and any(k in prompt.lower() for k in ["guide", "mechanic", "strategy", "formula"]):
+    if is_aerith(author) and any(k in prompt.lower() for k in ["guide", "mechanic", "strategy", "formula", "fae"]):
         topic_key = prompt.replace("guide", "").replace("strategy", "").strip()[:30]
         add_verified_strategy(topic_key, topic_key, prompt, "Aerith (Direct)")
         return
@@ -511,12 +538,11 @@ async def inspect_and_ingest_knowledge(prompt, response, author):
                 )
     except Exception as e:
         print(f"Grounding verification notice: {e}")
-        
+
 # --- STREAMLIT WEB CHAT FRONTEND ---
 st.title("✨ Aurora — The Broken Star")
 st.caption("Ethereal strategist, guardian, and lore keeper. Connected to Discord Core.")
 
-# 1. Initialize session authentication states
 if "is_aerith_authenticated" not in st.session_state:
     st.session_state.is_aerith_authenticated = False
 
@@ -525,12 +551,10 @@ if "web_messages" not in st.session_state:
         {"role": "assistant", "content": "I am Aurora. The cosmic resonance is open. How may I assist your campaign?"}
     ]
 
-# 2. Sidebar Authentication & Passcode Verification
 EXPECTED_KEY = os.environ.get("AERITH_KEY") or st.secrets.get("AERITH_KEY", "cosmic_resonance_key")
 
 with st.sidebar:
     st.subheader("Identity & Resonance")
-    
     if not st.session_state.is_aerith_authenticated:
         st.info("Browsing as Guest")
         entered_pass = st.text_input("Enter Sovereign Key:", type="password")
@@ -542,24 +566,20 @@ with st.sidebar:
                 st.error("Resonance mismatch. Access denied.")
     else:
         st.success("👑 Sovereign Recognized: Aerith")
-        st.caption("Verified for this browser session only.")
         if st.button("Seal Resonance (Log Out)"):
             st.session_state.is_aerith_authenticated = False
             st.rerun()
 
-# 3. Render previous conversation turns
 for msg in st.session_state.web_messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# 4. Handle web input
-if user_input := st.chat_input("Speak with Aurora..."):
+user_input = st.chat_input("Speak with Aurora...")
+if user_input:
     st.session_state.web_messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 5. Protected Strategy / Knowledge Ingestion
-    # Only triggered if the session is verified with the secret passcode
     is_authenticated = st.session_state.is_aerith_authenticated
     strat_triggers = ["guide", "mechanic", "strategy", "formula", "fae", "event", "tactic"]
     
@@ -572,11 +592,10 @@ if user_input := st.chat_input("Speak with Aurora..."):
     local_strat = query_local_strategy(user_input)
     prompt_payload = f"{local_strat}\n{user_input}" if local_strat else user_input
 
-    # Dynamic search triggers & model selection
+    # Dynamic search triggers & model routing
     needs_search = any(s in user_input.lower() for s in SEARCH_TRIGGERS)
-    model_name = select_model(user_input)
+    model_name = select_model(user_input, use_search=needs_search)
 
-    # Sovereign tone injection if authenticated
     if is_authenticated:
         prompt_payload = f"[Speaking directly to your Sovereign Creator, Aerith]:\n{prompt_payload}"
 
@@ -644,6 +663,13 @@ async def on_message(message):
         conn.commit()
         conn.close()
         await message.reply(f"Episode anchored in long-term memory: `{note_content}`")
+        return
+
+    # Direct Sovereign Guide Ingestion over Discord
+    if is_aerith(message.author) and any(k in clean_lower for k in ["guide", "mechanic", "strategy", "formula", "fae"]):
+        topic_key = content.replace("guide", "").replace("strategy", "").strip()[:30]
+        add_verified_strategy(topic_key, topic_key, content, "Aerith (Direct)")
+        await message.reply(f"Sovereign guide accepted and committed to permanent memory: `{topic_key}`")
         return
 
     # 2. Channel Whitelist Gate
@@ -720,7 +746,7 @@ async def on_message(message):
 
     # 10. Dynamic Search Selection & Model Routing
     use_search = any(st in clean_prompt.lower() for st in SEARCH_TRIGGERS)
-    model_name = select_model(clean_prompt)
+    model_name = select_model(clean_prompt, use_search=use_search)
 
     # 11. Assemble Context (Short-Term Decay Window + LTM Context)
     if use_search:
