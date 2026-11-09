@@ -394,7 +394,151 @@ def init_db():
             "Kingdom Merge & Migration",
             "Migration Strategy: Ensure your resource totals are below vault protection thresholds or spent on research before migrating. Collect required migration passes during event discounts.",
             "Aerith"
+        ),
+
+        # =========================================================================
+        # --- FAE REALM: UNIVERSAL LAWS & ALL-SEASON DOCTRINES ($0 TOKENS) ---
+        # =========================================================================
+        (
+            "fae rules",
+            "Fae Realm Universal Rules & Lifecycle",
+            "Universal Fae System Mechanics: "
+            "1. Seasonal Reset: Every Fae season resets seasonal research, seasonal buildings, and seasonal territory; permanent castle stats, main gear, and heroes are unaffected. "
+            "2. Sanctum Prioritization: Early phase focus must be 100% on securing Gathering and Speed Sanctums before military checkpoints. Sanctum production buffs compound season-long growth. "
+            "3. Research Economy Tree First: Never push combat nodes first. Prioritize 'Gathering Speed', 'Processing Efficiency', and 'Seasonal March Speed' to compound material generation before warfare phases open. "
+            "4. Territory Adjacency: Rallies and passes can only be taken if adjacent to contiguous alliance territory banners. Banners must never be cut off or disconnected. "
+            "5. Attrition Management: Troops wounded inside Fae battle zones consume seasonal medicine/essences rather than core kingdom healing resources; pace march losses to prevent seasonal hospital overflow.",
+            "Aerith"
+        ),
+        (
+            "fae seasons",
+            "Fae Seasons Overview & Architecture",
+            "Standard Fae Season Lifecycle: Phase 1: Land grab, border expansion, and initial resource point occupation. Phase 2: Sanctum unlock and regional pass battles. Phase 3: Central World Tree / Core Throne contention. Always reserve march speed-ups, high-tier stamina items, and peace shields specifically for Pass Openings and Core Battles.",
+            "Aerith"
+        ),
+
+        # =========================================================================
+        # --- FAE SEASONS: DEDICATED SEASON-BY-SEASON MATRICES ---
+        # =========================================================================
+        (
+            "fae season 1",
+            "Fae Season 1: Awakening of the Grove",
+            "Season 1 Mechanics: Foundational Fae season. Focus: Establish baseline alliance territory lines toward Tier 1 Sanctums. Key Strategy: Maximize seasonal wood/iron gathering nodes early; maintain strict 45% Infantry frontlines for NPC Grove guardians.",
+            "Aerith"
+        ),
+        (
+            "fae season 2",
+            "Fae Season 2: Whispering Mire",
+            "Season 2 Mechanics: Swamp territory with march speed debuffs. Key Strategy: Prioritize environmental movement resistance research in the seasonal tree. Position alliance fortresses to bypass narrow choke points in the wetlands.",
+            "Aerith"
+        ),
+        (
+            "fae season 3",
+            "Fae Season 3: Twilight Thorns",
+            "Season 3 Mechanics: Defending thorns impose passive attrition on sustained rallies. Key Strategy: Rotate rally leads to spread bleed damage. High Bowman backline DPS is essential to burn down thorny fortress nodes before attrition stacks wipe Infantry.",
+            "Aerith"
+        ),
+        (
+            "fae season 4",
+            "Fae Season 4: Crystal Shards",
+            "Season 4 Mechanics: Introduction of seasonal crystal refining nodes. Key Strategy: Protect central crystal veins. Dedicate off-peak hours for gatherer protection; crystal tech yields significant seasonal march capacity upgrades.",
+            "Aerith"
+        ),
+        (
+            "fae season 5",
+            "Fae Season 5: Ancient Canopy",
+            "Season 5 Mechanics: Multi-elevation battlefields with canopy watchtowers. Key Strategy: Garrison towers immediately upon pass unlocking to claim aerial bombardment buffs against enemy field marches.",
+            "Aerith"
+        ),
+        (
+            "fae season 6",
+            "Fae Season 6: Frozen Tundra",
+            "Season 6 Mechanics: Severe cold attrition outside heated outposts. Key Strategy: Keep marches tethered to alliance warm-zones. Do not deploy naked marches across blizzard lanes without heat stones active.",
+            "Aerith"
+        ),
+        (
+            "fae season 7",
+            "Fae Season 7: Mystery of the Dunes",
+            "Season 7 Dunes Mechanics: Arid desert battlefield with water/oasis resource control and sandstorm territory locks. Key Strategy: Secure and reinforce water wells early to avoid troop dehydration debuffs. Choke enemy supply lines between contested oases prior to central temple unlocks.",
+            "Aerith"
+        ),
+        (
+            "fae season 8",
+            "Fae Season 8: Obsidian Spires",
+            "Season 8 Mechanics: Volcanic terrain with periodic lava surges disabling outer banners. Key Strategy: Fortify inner perimeter lines. Spire captures grant explosive rally buffs for 30 minutes; time major pushes around spire cooldowns.",
+            "Aerith"
+        ),
+        (
+            "fae season 9",
+            "Fae Season 9: Sunken Glade",
+            "Season 9 Mechanics: Periodic tide surges alter viable pathing lanes. Key Strategy: Pre-coordinate march timers so reinforcements do not get trapped when water barriers rise.",
+            "Aerith"
+        ),
+        (
+            "fae season 10",
+            "Fae Season 10: Celestial Bloom",
+            "Season 10 Mechanics: Dual-cycle Day/Night bloom states. Key Strategy: Defensive actions receive 25% stat boosts during Night; offensive rally operations should strictly launch during Peak Solar Day phases.",
+            "Aerith"
+        ),
+        (
+            "fae season 11",
+            "Fae Season 11: Shattered Canopy",
+            "Season 11 Mechanics: Aerial rift navigation and splintered sanctums. Key Strategy: Coordinate dual-front skirmish teams. Prevent enemy alliances from linking split sanctuary networks.",
+            "Aerith"
+        ),
+        (
+            "fae season 12",
+            "Fae Season 12: Echoing Caverns",
+            "Season 12 Mechanics: Subterranean tunnels where cavalry flank bonuses are heavily amplified. Key Strategy: Increase Cavalry ratios to 35% in choke-point skirmishes.",
+            "Aerith"
+        ),
+        (
+            "fae season 13",
+            "Fae Season 13: Primal Roots",
+            "Season 13 Mechanics: Root network regenerates defensive walls rapidly. Key Strategy: Use high-burst siege/cavalry timing to break gates in single concentrated rally waves.",
+            "Aerith"
+        ),
+        (
+            "fae season 14",
+            "Fae Season 14: Radiant Mirage",
+            "Season 14 Mechanics: Decoy sanctums and false territory markers. Key Strategy: Strict scouting protocol before allocating high-cost war banners; verify true core nodes via scouting coordinates.",
+            "Aerith"
+        ),
+        (
+            "fae season 15",
+            "Fae Season 15: Phantom Mist",
+            "Season 15 Mechanics: Fog of war obscures enemy march sizes until within 5km. Key Strategy: Establish radar perimeter garrisons along border outposts to trigger early warning flares.",
+            "Aerith"
+        ),
+        (
+            "fae season 16",
+            "Fae Season 16: Eternal Eclipse",
+            "Season 16 Mechanics: Extended shadow debuff reduces healing speed. Key Strategy: Minimize reckless attrition; hoard seasonal healing elixirs exclusively for Coalition gate assaults.",
+            "Aerith"
+        ),
+        (
+            "fae season 17",
+            "Fae Season 17: Stormforged Peaks",
+            "Season 17 Mechanics: Lightning hazards randomly strike march routes outside sanctum protective fields. Key Strategy: Leapfrog marches from sanctum to sanctum rather than using cross-map pathing.",
+            "Aerith"
+        ),
+        (
+            "fae season 18",
+            "Fae Season 18: Verdant Bastion",
+            "Season 18 Mechanics: Fortified super-sanctums requiring tiered multi-rally strikes. Key Strategy: Stagger frontline Infantry break-in teams 3 seconds ahead of main DPS swarms.",
+            "Aerith"
+        ),
+        (
+            "fae season 19",
+            "Fae Season 19: Core Resonance & Seasonal Warfare",
+            "Season 19 Tactical Matrix: "
+            "1. Seasonal Architecture: Latest Solar progression framework incorporating advanced Fae tree militarization and high-yield sanctums. "
+            "2. Core Priority: Maximize seasonal economic research nodes in days 1-5; transition to troop defense/health trees before Level 3 Passes open. "
+            "3. Rally Formations: Maintain strict 45% Infantry / 30% Cav / 25% Bowmen. Frontline collapse in S19 leads to instant wipeout against specialized seasonal siege defenses. "
+            "4. Sovereign Directives: Detailed tactical updates, specific map layout breakdowns, and milestone turn-in times are directly committed by Aerith.",
+            "Aerith"
         )
+        
     ]
 
     c.executemany(
