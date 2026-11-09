@@ -1,5 +1,5 @@
-discord.py
-google-genai
-streamlit
-tenacity
+streamlit>=1.35.0
+discord.py>=2.3.2
+google-genai>=0.1.1
+tenacity>=8.2.3
 duckduckgo_search
