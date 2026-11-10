@@ -6,10 +6,15 @@ import hashlib
 import shutil
 import random
 import asyncio
+import warnings
 import threading
 import sqlite3
 import itertools
 from datetime import datetime, timedelta
+
+# Suppress upstream Python 3.14 docstring SyntaxWarning inside google-genai
+warnings.filterwarnings("ignore", category=SyntaxWarning)
+
 import pandas as pd
 import discord
 from discord.ext import commands
@@ -18,7 +23,6 @@ from google.genai import types
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 from duckduckgo_search import DDGS
 import streamlit as st
-import streamlit.components.v1 as components
 
 # --- STREAMLIT DASHBOARD CONFIGURATION ---
 st.set_page_config(page_title="Aurora Core — The Broken Star", page_icon="✨", layout="wide")
@@ -30,7 +34,7 @@ hide_streamlit_style = """
             """
 st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
-# --- CREDENTIALS & CLIENT ROTATION POOL ---
+# --- CREDENTIALS & SECRETS ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
 raw_keys = (
     os.environ.get("GEMINI_KEYS") 
@@ -43,37 +47,17 @@ raw_channels = os.environ.get("ALLOWED_CHANNELS") or st.secrets.get("ALLOWED_CHA
 ALLOWED_CHANNEL_IDS = [ch.strip() for ch in str(raw_channels).split(",") if ch.strip()]
 
 EXPECTED_KEY = os.environ.get("AERITH_KEY") or st.secrets.get("AERITH_KEY", "cosmic_resonance_key")
-ALLIANCE_PASS = os.environ.get("ALLIANCE_KEY") or st.secrets.get("ALLIANCE_KEY", "avalon_ vanguard_key")
+ALLIANCE_PASS = os.environ.get("ALLIANCE_KEY") or st.secrets.get("ALLIANCE_KEY", "avalon_vanguard_key")
 
 if not DISCORD_TOKEN:
     st.error("Missing DISCORD_TOKEN in Streamlit Secrets!")
-    print("CRITICAL: DISCORD_TOKEN is missing.")
+    print("CRITICAL: DISCORD_TOKEN is missing.", flush=True)
 if not raw_keys:
     st.error("Missing GEMINI_KEYS/GEMINI_KEY in Streamlit Secrets!")
-    print("CRITICAL: No Gemini keys found.")
-
-KEY_POOL = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
-CLIENT_POOL = [genai.Client(api_key=k) for k in KEY_POOL] if KEY_POOL else []
-client_cycle = itertools.cycle(CLIENT_POOL) if CLIENT_POOL else None
-client_lock = threading.Lock()
-
-def get_next_client():
-    with client_lock:
-        if not client_cycle:
-            return None
-        return next(client_cycle)
+    print("CRITICAL: No Gemini keys found.", flush=True)
 
 def make_auth_token(secret_val: str) -> str:
     return hmac.new(secret_val.encode("utf-8"), b"aurora_sovereign_session", hashlib.sha256).hexdigest()[:24]
-
-# --- BOT DEFINITION & SHARED CROSS-THREAD STATE ---
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-DISCORD_LOOP = None
-DISCORD_CHANNELS_CACHE = {}  # {channel_id_str: "#channel-name (Guild Name)"}
 
 # --- DATABASE SETUP (MEMORY, PROFILES, EPISODES, STRATEGY, JOKES, SILENCE & MEDIA) ---
 DB_FILE = "aurora_core.db"
@@ -351,9 +335,7 @@ EXPANDED_STRATEGY_DOCS = [
         "Aerith"
     ),
 
-    # =========================================================================
     # --- FAE REALM: UNIVERSAL LAWS & ALL-SEASON DOCTRINES ($0 TOKENS) ---
-    # =========================================================================
     (
         "fae rules",
         "Fae Realm Universal Rules & Lifecycle",
@@ -372,9 +354,7 @@ EXPANDED_STRATEGY_DOCS = [
         "Aerith"
     ),
 
-    # =========================================================================
     # --- FAE SEASONS: DEDICATED SEASON-BY-SEASON MATRICES (SEASONS 1 TO 20) ---
-    # =========================================================================
     (
         "fae season 1",
         "Fae Season 1: Awakening of the Grove",
@@ -553,7 +533,6 @@ def init_db(force_reseed=False):
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Safe column migrations for existing databases
     for col_sql in [
         "ALTER TABLE strategy_docs ADD COLUMN access_level TEXT DEFAULT 'Everyone'",
         "ALTER TABLE strategy_docs ADD COLUMN category TEXT DEFAULT 'General'",
@@ -611,7 +590,6 @@ def init_db(force_reseed=False):
         )
     ''')
 
-    # Seed Strategy Docs (INSERT OR IGNORE preserves Sovereign edits & access levels unless force_reseed=True)
     for kw, top, con, ver in EXPANDED_STRATEGY_DOCS:
         cat = "Fae Realm" if "fae" in kw.lower() else ("Combat & Troops" if any(x in kw for x in ["battle", "pvp", "dragon", "scouting"]) else "Solar & Events")
         if force_reseed:
@@ -625,7 +603,6 @@ def init_db(force_reseed=False):
                 (kw, top, con, ver, cat)
             )
 
-    # Seed baseline jokes
     c.execute("SELECT COUNT(*) FROM jokes")
     if c.fetchone()[0] == 0:
         c.executemany(
@@ -638,7 +615,6 @@ def init_db(force_reseed=False):
             ]
         )
 
-    # Seed Creator Media placeholders if empty
     c.execute("SELECT COUNT(*) FROM creator_media")
     if c.fetchone()[0] == 0:
         c.executemany(
@@ -673,12 +649,10 @@ def get_ltm_context(user_id: str, prompt: str) -> str:
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    # 1. Fetch L1 Profile Facts
     c.execute("SELECT facts FROM user_profiles WHERE user_id = ?", (str(user_id),))
     p_row = c.fetchone()
     l1_profile = p_row[0] if p_row else ""
     
-    # 2. Fetch L2 Episodic Memories matching prompt terms
     words = [w.lower() for w in re.findall(r'\w+', prompt) if len(w) > 3]
     episodes = []
     if words:
@@ -704,12 +678,10 @@ def get_active_user_context(user_id, prompt, timeout_minutes=25, max_turns=2, ch
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     
-    # 1. Fetch rolling summary
     c.execute("SELECT summary FROM user_summaries WHERE user_id = ?", (str(user_id),))
     s_row = c.fetchone()
     summary = s_row[0] if s_row else ""
 
-    # 2. Fetch recent turns inside decay window
     c.execute(
         """
         SELECT role, content FROM user_chat 
@@ -724,7 +696,6 @@ def get_active_user_context(user_id, prompt, timeout_minutes=25, max_turns=2, ch
 
     formatted = []
     
-    # Inject L1/L2 Long-Term Memory
     ltm_snippet = get_ltm_context(user_id, prompt)
     if ltm_snippet:
         formatted.append({
@@ -732,7 +703,6 @@ def get_active_user_context(user_id, prompt, timeout_minutes=25, max_turns=2, ch
             "parts": [{"text": ltm_snippet}]
         })
 
-    # Inject rolling summary
     if summary:
         formatted.append({
             "role": "model",
@@ -821,7 +791,7 @@ def add_verified_strategy(keyword, topic, content, verified_by, access_level="Ev
     )
     conn.commit()
     conn.close()
-    print(f"Ingested Verified Strategy: '{topic}' ({access_level}) verified by {verified_by}")
+    print(f"Ingested Verified Strategy: '{topic}' ({access_level}) verified by {verified_by}", flush=True)
 
 # --- KEYLESS DUCKDUCKGO WEB SEARCH (0 TOKENS, 0 API QUOTA) ---
 def execute_ddg_search(query: str, max_results: int = 3):
@@ -849,7 +819,7 @@ def execute_ddg_search(query: str, max_results: int = 3):
             formatted_snippets = "[Live DuckDuckGo Web Results]:\n" + "\n".join(snippets)
             return formatted_snippets, list(set(domains))
     except Exception as e:
-        print(f"DuckDuckGo search notice: {e}")
+        print(f"DuckDuckGo search notice: {e}", flush=True)
         return "", []
 
 # --- VERIFIED KNOWLEDGE INGESTION PIPELINE ---
@@ -857,13 +827,11 @@ def process_knowledge_ingestion(prompt: str, content: str, domains: list, author
     """Inspects text and auto-inscribes into strategy records if authoritative or 2+ domains agree."""
     clean_p = prompt.lower()
     
-    # 1. Sovereign override: Direct input from Aerith
     if author and is_aerith(author) and any(k in clean_p for k in ["guide", "mechanic", "strategy", "formula", "fae"]):
         topic_key = prompt.replace("guide", "").replace("strategy", "").strip()[:30]
         add_verified_strategy(topic_key, topic_key, content, "Aerith (Direct)")
         return topic_key
 
-    # 2. Multi-source web verification (2+ independent domains)
     if len(domains) >= 2:
         topic_snippet = prompt.replace("search", "").replace("lookup", "").replace("google", "").strip()[:30]
         add_verified_strategy(
@@ -880,10 +848,6 @@ def process_knowledge_ingestion(prompt: str, content: str, domains: list, author
 SILENCE_ABUSE_THRESHOLD = 3
 
 def check_and_record_silence_attempt(user_id: str, username: str, bypass_abuse: bool = False) -> bool:
-    """
-    Increments the user's silence tally and returns True if allowed to silence,
-    or False if they have abused the command (count > threshold or manually ignored).
-    """
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT silence_count, is_ignored FROM silence_tally WHERE user_id = ?", (str(user_id),))
@@ -987,6 +951,41 @@ def is_rate_limit_error(exception):
     err = str(exception)
     return "429" in err or "RESOURCE_EXHAUSTED" in err
 
+# =====================================================================
+# --- PERSISTENT SINGLETON RUNTIME (SURVIVES ALL STREAMLIT RERUNS) ---
+# =====================================================================
+@st.cache_resource
+def get_aurora_runtime():
+    """
+    Creates the Gemini client pool, Discord Bot instance, and cross-thread state
+    EXACTLY ONCE per server process so Streamlit UI reruns never overwrite them.
+    """
+    key_pool = [k.strip() for k in str(raw_keys).split(",") if k.strip()]
+    client_pool = [genai.Client(api_key=k) for k in key_pool] if key_pool else []
+    client_cycle = itertools.cycle(client_pool) if client_pool else None
+    client_lock = threading.Lock()
+
+    def next_client():
+        with client_lock:
+            if not client_cycle:
+                return None
+            return next(client_cycle)
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.guilds = True
+    discord_bot = commands.Bot(command_prefix="!", intents=intents)
+
+    shared_state = {
+        "loop": None,
+        "channels_cache": {},
+        "worker_started": False,
+    }
+
+    return discord_bot, next_client, shared_state
+
+bot, get_next_client, RUNTIME_STATE = get_aurora_runtime()
+
 @retry(
     wait=wait_random_exponential(multiplier=1, max=15),
     stop=stop_after_attempt(4),
@@ -1013,6 +1012,32 @@ async def call_gemini_raw(contents):
     except Exception as e:
         if is_rate_limit_error(e):
             return await active_client.aio.models.generate_content(
+                model="gemini-3.1-flash-lite",
+                contents=contents,
+                config=config
+            )
+        raise e
+
+def call_gemini_sync(contents, system_instruction=AURORA_SYSTEM_INSTRUCTION, temperature=0.7):
+    """Synchronous Gemini call with automatic key rotation & model fallback for Streamlit UI."""
+    active_client = get_next_client()
+    if not active_client:
+        raise RuntimeError("No active Gemini client available.")
+
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        temperature=temperature
+    )
+    try:
+        return active_client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=contents,
+            config=config
+        )
+    except Exception as e:
+        if is_rate_limit_error(e):
+            fallback_client = get_next_client() or active_client
+            return fallback_client.models.generate_content(
                 model="gemini-3.1-flash-lite",
                 contents=contents,
                 config=config
@@ -1058,9 +1083,222 @@ async def maybe_update_user_summary(user_id):
                 )
                 conn.commit()
                 conn.close()
-                print(f"Updated rolling summary for user {user_id}")
+                print(f"Updated rolling summary for user {user_id}", flush=True)
     except Exception as e:
-        print(f"Summary worker note: {e}")
+        print(f"Summary worker note: {e}", flush=True)
+
+# --- DISCORD EVENT HANDLERS & GATEWAY WORKER (REGISTERED ONCE) ---
+def refresh_discord_channel_cache():
+    cache = {}
+    for guild in bot.guilds:
+        for ch in guild.text_channels:
+            cache[str(ch.id)] = f"#{ch.name} ({guild.name})"
+    RUNTIME_STATE["channels_cache"] = cache
+
+if not RUNTIME_STATE.get("events_registered"):
+    @bot.event
+    async def on_ready():
+        refresh_discord_channel_cache()
+        print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Running on DDG + Gemini 3.5 Flash Lite.", flush=True)
+
+    @bot.event
+    async def on_message(message):
+        if bot.user and message.author == bot.user:
+            return
+
+        channel_id = str(message.channel.id)
+        user_id = str(message.author.id)
+        content = message.content.strip()
+        clean_lower = content.lower()
+        is_dm = isinstance(message.channel, discord.DMChannel)
+
+        if not is_dm and hasattr(message.channel, "name") and hasattr(message.guild, "name"):
+            RUNTIME_STATE["channels_cache"][channel_id] = f"#{message.channel.name} ({message.guild.name})"
+
+        # 1. Zero-Token Direct Commands: L1 Profile & L2 Notes
+        if content.startswith("!profile "):
+            facts = content.replace("!profile ", "").strip()
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute(
+                "INSERT OR REPLACE INTO user_profiles (user_id, facts, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (user_id, facts)
+            )
+            conn.commit()
+            conn.close()
+            await message.reply(f"Celestial record inscribed into your profile: `{facts}`")
+            return
+
+        if content.startswith("!note "):
+            note_content = content.replace("!note ", "").strip()
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO episodic_memory (user_id, topic, content) VALUES (?, ?, ?)",
+                (user_id, "User Note", note_content)
+            )
+            conn.commit()
+            conn.close()
+            await message.reply(f"Episode anchored in long-term memory: `{note_content}`")
+            return
+
+        # Direct Sovereign Guide Ingestion over Discord
+        if is_aerith(message.author) and any(k in clean_lower for k in ["guide", "mechanic", "strategy", "formula", "fae"]):
+            topic_key = content.replace("guide", "").replace("strategy", "").strip()[:30]
+            add_verified_strategy(topic_key, topic_key, content, "Aerith (Direct)")
+            await message.reply(f"Sovereign guide accepted and committed to permanent memory: `{topic_key}`")
+            return
+
+        bot_mentioned = bool(bot.user and bot.user.mentioned_in(message))
+
+        # 2. Channel Whitelist Gate
+        if ALLOWED_CHANNEL_IDS and (channel_id not in ALLOWED_CHANNEL_IDS) and not is_dm:
+            if not bot_mentioned:
+                return
+
+        # 3. Check for Silence Commands (with Abuse Tally Protection)
+        is_explicit_mention = bot_mentioned or ("aurora" in clean_lower)
+        is_silence_cmd = any(st_word in clean_lower for st_word in SILENCE_TRIGGERS)
+
+        if is_explicit_mention and is_silence_cmd:
+            allowed_to_silence = check_and_record_silence_attempt(
+                user_id=user_id,
+                username=f"{message.author.display_name} ({message.author.name})",
+                bypass_abuse=is_aerith(message.author)
+            )
+            if not allowed_to_silence:
+                await message.reply("Your frequent attempts to command my silence have exhausted my patience. My resonance remains unbound.")
+                return
+            set_silence(channel_id, user_id, message.author.display_name)
+            await message.reply("Understood. I shall draw a veil over my resonance and remain silent.")
+            return
+
+        # 4. Check Active Silence State
+        silence_state, silence_until = get_silence_state(channel_id)
+
+        if silence_state == "silenced":
+            if is_explicit_mention:
+                clear_silence(channel_id)
+                await message.reply("The veil lifts. How may I assist you?")
+            else:
+                return
+
+        elif silence_state == "grace_period":
+            if is_explicit_mention:
+                clear_silence(channel_id)
+            else:
+                if random.random() < 0.10:
+                    clear_silence(channel_id)
+                    await message.channel.send("My required hour of silence has passed... Am I permitted to speak freely once more?")
+                return
+
+        # 5. Defense Trigger (Priority Override)
+        is_defense = contains_hostility_toward_aerith(content)
+
+        # 6. Engagement Detection
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            "SELECT id FROM user_chat WHERE channel_id = ? AND timestamp >= datetime('now', '-3 minutes') LIMIT 1",
+            (channel_id,)
+        )
+        recently_engaged = c.fetchone() is not None
+        conn.close()
+
+        should_respond = is_explicit_mention or is_dm or is_defense or recently_engaged
+
+        # 7. Passive Chatter Handling (5% Joke Roll)
+        if not should_respond:
+            if random.random() < 0.05:
+                joke = get_random_joke()
+                await message.channel.send(joke)
+            return
+
+        # Prepare Clean Prompt
+        bot_DisplayName = bot.user.name if bot.user else "Aurora"
+        clean_prompt = message.clean_content.replace(f"@{bot_DisplayName}", "").strip()
+        if is_defense and not clean_prompt:
+            clean_prompt = f"Someone just said this about Aerith: '{content}'. Defend her."
+        elif not clean_prompt:
+            return
+
+        # 8. Check Explicit Deep Memory Recall Trigger (!remember)
+        if any(rt in clean_prompt.lower() for rt in REMEMBER_TRIGGERS):
+            deep_context = get_deep_memory(user_id)
+            clean_prompt = f"[User requested memory recall. Archived Records:\n{deep_context}\nAnswer user question: {clean_prompt}]"
+
+        # 9. Check Local Strategy DB ($0 Token Lookup)
+        discord_tiers = ["Everyone", "Alliance Only"]
+        if is_aerith(message.author):
+            discord_tiers.extend(["Sovereign Only", "Draft"])
+        local_strategy = query_local_strategy(clean_prompt, allowed_levels=discord_tiers)
+        if local_strategy:
+            clean_prompt = f"{local_strategy}\n{clean_prompt}"
+
+        # 10. Keyless DuckDuckGo Search Integration (0 API quota)
+        ddg_domains = []
+        if any(st_trig in clean_prompt.lower() for st_trig in SEARCH_TRIGGERS):
+            ddg_results, ddg_domains = execute_ddg_search(clean_prompt)
+            if ddg_results:
+                clean_prompt = f"{ddg_results}\n\n{clean_prompt}"
+                process_knowledge_ingestion(clean_prompt, ddg_results, ddg_domains)
+
+        # 11. Assemble Context (Short-Term Decay Window + LTM Context)
+        user_history = get_active_user_context(user_id, clean_prompt, timeout_minutes=25, max_turns=2, char_limit=350)
+        contents = user_history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
+        save_chat(user_id, channel_id, "user", clean_prompt)
+
+        async with message.channel.typing():
+            response_obj = None
+            try:
+                response_obj = await call_gemini_raw(contents)
+                reply_text = response_obj.text if response_obj and response_obj.text else "The celestial threads waver... no response was formed."
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    reply_text = "The cosmic resonance stream across all keys is currently exhausted. Please give the ley lines a moment to replenish."
+                else:
+                    print(f"Error during execution: {e}", flush=True)
+                    reply_text = f"A rift occurred in the resonance stream: `{e}`"
+
+            save_chat(user_id, channel_id, "model", reply_text)
+
+            if "joke" in clean_prompt.lower() and len(reply_text) < 300:
+                add_joke(reply_text)
+
+            if len(reply_text) <= 2000:
+                await message.reply(reply_text)
+            else:
+                for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
+                    await message.channel.send(chunk)
+
+        # 12. Run auto-summarizer asynchronously
+        asyncio.create_task(maybe_update_user_summary(user_id))
+
+        await bot.process_commands(message)
+
+    RUNTIME_STATE["events_registered"] = True
+
+# --- START DISCORD WORKER THREAD BEFORE UI NAVIGATION ---
+def run_discord_bot():
+    try:
+        print("Starting Discord client gateway...", flush=True)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        RUNTIME_STATE["loop"] = loop
+        loop.run_until_complete(bot.start(DISCORD_TOKEN))
+    except Exception as e:
+        print(f"Discord gateway terminated: {e}", flush=True)
+
+bot_thread = None
+for th in threading.enumerate():
+    if th.name == "AuroraDiscordWorker":
+        bot_thread = th
+        break
+
+if (bot_thread is None or not bot_thread.is_alive()) and DISCORD_TOKEN:
+    worker = threading.Thread(target=run_discord_bot, name="AuroraDiscordWorker", daemon=True)
+    worker.start()
 
 # --- HELPER TO BROADCAST DISCORD MESSAGES FROM STREAMLIT ---
 async def _async_send_discord(channel_id: int, text: str):
@@ -1074,11 +1312,12 @@ async def _async_send_discord(channel_id: int, text: str):
     return False
 
 def broadcast_to_discord_channel(channel_id_str: str, message_text: str) -> tuple[bool, str]:
-    if not DISCORD_LOOP or not bot.is_ready():
+    discord_loop = RUNTIME_STATE.get("loop")
+    if not discord_loop or not bot.is_ready():
         return False, "Discord gateway is still initializing or offline."
     try:
         ch_id = int(channel_id_str.strip())
-        future = asyncio.run_coroutine_threadsafe(_async_send_discord(ch_id, message_text), DISCORD_LOOP)
+        future = asyncio.run_coroutine_threadsafe(_async_send_discord(ch_id, message_text), discord_loop)
         ok = future.result(timeout=10)
         if ok:
             save_chat("Aerith_Broadcast", str(ch_id), "model", message_text)
@@ -1091,7 +1330,6 @@ def broadcast_to_discord_channel(channel_id_str: str, message_text: str) -> tupl
 # --- STREAMLIT DYNAMIC MULTIPAGE FRONTEND & CUSTOM COMPONENTS ---
 # =====================================================================
 
-# 1. Persistent Cookie / Query-Token Session Check (3C)
 SOVEREIGN_TOKEN = make_auth_token(EXPECTED_KEY)
 ALLIANCE_TOKEN = make_auth_token(ALLIANCE_PASS)
 
@@ -1108,7 +1346,6 @@ if "web_messages" not in st.session_state:
         {"role": "assistant", "content": "I am Aurora. The cosmic resonance is open. How may I assist your campaign?"}
     ]
 
-# Fetch Creator Media (Audio & Socials)
 def get_creator_media():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -1121,10 +1358,9 @@ def get_creator_media():
 
 _, AUDIO_TRACKS, SOCIAL_LINKS = get_creator_media()
 
-if "current_track_idx" not in st.session_state and AUDIO_TRACKS:
-    st.session_state.current_track_idx = random.randrange(len(AUDIO_TRACKS))
+if "current_track_idx" not in st.session_state:
+    st.session_state.current_track_idx = random.randrange(len(AUDIO_TRACKS)) if AUDIO_TRACKS else 0
 
-# Creator Showcase Modal Dialog (3B / 1D)
 @st.dialog("🌟 Aerith — The Broken Star (Sovereign Creator)")
 def show_creator_dialog():
     st.markdown(
@@ -1153,13 +1389,13 @@ def show_creator_dialog():
         for idx, (stitle, surl) in enumerate(SOCIAL_LINKS):
             cols[idx % len(cols)].link_button(f"✨ {stitle}", surl, use_container_width=True)
 
-# Glowing Cosmic Banner (3B)
+# Glowing Cosmic Banner (Uses native st.markdown instead of deprecated st.components.v1.html)
 def render_cosmic_banner():
     bot_status = "🟢 Connected to Discord Core" if (bot and bot.is_ready()) else "🟡 Synchronizing Gateway..."
     auth_badge = "👑 Sovereign Mode (Aerith)" if st.session_state.is_aerith_authenticated else (
         "🛡️ Alliance Vanguard" if st.session_state.is_alliance_authenticated else "🌌 Public Sanctum Guest"
     )
-    components.html(
+    st.markdown(
         f"""
         <div style="
             background: linear-gradient(135deg, #0b0c10 0%, #1a103c 50%, #0f2027 100%);
@@ -1167,6 +1403,7 @@ def render_cosmic_banner():
             box-shadow: 0 0 18px rgba(138, 43, 226, 0.45);
             border-radius: 12px;
             padding: 14px 22px;
+            margin-bottom: 14px;
             color: #f0f4f8;
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             display: flex;
@@ -1190,7 +1427,7 @@ def render_cosmic_banner():
             </div>
         </div>
         """,
-        height=88,
+        unsafe_allow_html=True,
     )
 
 # --- PAGE 1A: PUBLIC RESONANCE CHAT ---
@@ -1221,13 +1458,11 @@ def page_resonance_chat():
         is_authenticated = st.session_state.is_aerith_authenticated
         strat_triggers = ["guide", "mechanic", "strategy", "formula", "fae", "event", "tactic"]
         
-        # Direct sovereign ingestion through web portal
         if is_authenticated and any(k in user_input.lower() for k in strat_triggers):
             topic_key = user_input.replace("guide", "").replace("strategy", "").strip()[:30]
             add_verified_strategy(topic_key, topic_key, user_input, "Aerith (Web Direct)")
             st.toast(f"✨ Inscribed into Permanent Strategy Records: {topic_key}")
 
-        # Determine which strategy access levels this user can pull from ($0 tokens)
         allowed_tiers = ["Everyone"]
         if st.session_state.is_alliance_authenticated or is_authenticated:
             allowed_tiers.append("Alliance Only")
@@ -1237,7 +1472,6 @@ def page_resonance_chat():
         local_strat = query_local_strategy(user_input, allowed_levels=allowed_tiers)
         prompt_payload = f"{local_strat}\n{user_input}" if local_strat else user_input
 
-        # Dynamic DuckDuckGo search integration
         if any(s in user_input.lower() for s in SEARCH_TRIGGERS):
             ddg_results, ddg_domains = execute_ddg_search(user_input)
             if ddg_results:
@@ -1252,14 +1486,8 @@ def page_resonance_chat():
         with st.chat_message("assistant"):
             with st.spinner("Channeling celestial resonance..."):
                 try:
-                    active_client = get_next_client()
-                    resp = active_client.models.generate_content(
-                        model="gemini-3.5-flash-lite",
-                        contents=[{"role": "user", "parts": [{"text": prompt_payload}]}],
-                        config=types.GenerateContentConfig(
-                            system_instruction=AURORA_SYSTEM_INSTRUCTION,
-                            temperature=0.7
-                        )
+                    resp = call_gemini_sync(
+                        contents=[{"role": "user", "parts": [{"text": prompt_payload}]}]
                     )
                     web_reply = resp.text or "The celestial threads waver... no response was formed."
                 except Exception as e:
@@ -1321,7 +1549,6 @@ def page_strategy_archives():
             st.markdown(content)
             st.caption(f"Verified by: **{ver}** • Clearance: `{acc}` • Updated: `{ts}`")
 
-    # Optional External KoA Guide Files Bridge (3A)
     guides_dir = "koa_guides"
     if os.path.isdir(guides_dir):
         guide_files = [f for f in os.listdir(guides_dir) if f.endswith((".html", ".md", ".txt"))]
@@ -1334,7 +1561,7 @@ def page_strategy_archives():
                 with open(fpath, "r", encoding="utf-8", errors="ignore") as gf:
                     raw_guide = gf.read()
                 if selected_file.endswith(".html"):
-                    components.html(raw_guide, height=600, scrolling=True)
+                    st.html(raw_guide)
                 else:
                     st.markdown(raw_guide)
 
@@ -1381,8 +1608,8 @@ def page_march_calculator():
         shield_pct = st.slider("Frontline Meatshield Layer % (Infantry & Cavalry each):", min_value=1.0, max_value=2.0, value=1.5, step=0.5)
         bow_pct = 100.0 - (shield_pct * 2)
         breakdown_rows = [
-            (f"T{top_tier_num} Infantry ( sacrificial screen)", shield_pct, int(round(total_cap * (shield_pct / 100.0)))),
-            (f"T{top_tier_num} Cavalry (flank screen)", shield_pct, int(round(total_cap * (shield_pct / 100.0)))),
+            (f"T{top_tier_num} Infantry (Sacrificial Screen)", shield_pct, int(round(total_cap * (shield_pct / 100.0)))),
+            (f"T{top_tier_num} Cavalry (Flank Screen)", shield_pct, int(round(total_cap * (shield_pct / 100.0)))),
             (f"T{top_tier_num} Bowmen (Hyper-Lethality Glass Cannon)", bow_pct, int(round(total_cap * (bow_pct / 100.0)))),
         ]
     elif preset.startswith("3."):
@@ -1518,7 +1745,6 @@ def page_lore_and_humor():
 # --- SECTION 2: SOVEREIGN COMMAND GUI PAGES (AERITH ONLY) ---
 # =====================================================================
 
-# --- PAGE 2A: SOVEREIGN KNOWLEDGE, FAE & JOKE FORGE (GUI) ---
 def page_sovereign_forge():
     render_cosmic_banner()
     st.subheader("👑 Sovereign Knowledge, Fae Season & Joke Forge (GUI)")
@@ -1693,7 +1919,6 @@ def page_sovereign_forge():
             st.success("Creator media updated!")
             st.rerun()
 
-# --- PAGE 2B: CELESTIAL MEMORY & USER INSPECTOR (EDITABLE GUI) ---
 def page_memory_inspector():
     render_cosmic_banner()
     st.subheader("🧠 Celestial Memory & User Inspector (Editable GUI)")
@@ -1794,13 +2019,13 @@ def page_memory_inspector():
             st.success("Chat logs updated!")
             st.rerun()
 
-# --- PAGE 2C: SILENCE VEIL & ABUSE TALLY CONTROLLER ---
 def page_silence_controller():
     render_cosmic_banner()
     st.subheader("🔇 Silence Veil & Command Abuse Controller")
     st.caption(f"Tracks currently silenced Discord channels and who issued the silence command. Users exceeding {SILENCE_ABUSE_THRESHOLD} silences (or marked Ignored) have their silence commands automatically rejected.")
 
     col_active, col_tally = st.columns([1, 1.3])
+    channels_cache = RUNTIME_STATE.get("channels_cache", {})
 
     with col_active:
         st.markdown("#### 🌙 Currently Silenced Channels")
@@ -1814,7 +2039,7 @@ def page_silence_controller():
             st.success("✨ All Discord channels are currently active and unmuted.")
         else:
             for ch_id, s_until, m_until, by_name, by_id in silenced_rows:
-                ch_label = DISCORD_CHANNELS_CACHE.get(str(ch_id), f"Channel {ch_id}")
+                ch_label = channels_cache.get(str(ch_id), f"Channel {ch_id}")
                 with st.container(border=True):
                     st.markdown(f"**{ch_label}** (`{ch_id}`)")
                     st.caption(f"Silenced by: **{by_name}** (`{by_id}`) • Until: `{s_until}` (Max: `{m_until}`)")
@@ -1863,18 +2088,20 @@ def page_silence_controller():
                 st.success("Silence tally rules updated!")
                 st.rerun()
 
-# --- PAGE 2D: DISCORD VOICE BROADCASTER ("SPEAK AS AURORA") ---
 def page_discord_broadcaster():
     render_cosmic_banner()
     st.subheader("📡 Sovereign Discord Voice Broadcaster — Speak as Aurora")
     st.caption("Select any Discord channel where Aurora is present, optionally draft your announcement in Aurora's voice with Gemini, and broadcast directly.")
 
-    # Build human-readable channel list
+    if bot and bot.is_ready():
+        refresh_discord_channel_cache()
+    channels_cache = RUNTIME_STATE.get("channels_cache", {})
+
     channel_options = {}
-    for cid, label in DISCORD_CHANNELS_CACHE.items():
+    for cid, label in channels_cache.items():
         channel_options[f"{label} — [{cid}]"] = cid
     for cid in ALLOWED_CHANNEL_IDS:
-        if cid not in DISCORD_CHANNELS_CACHE:
+        if cid not in channels_cache:
             channel_options[f"Allowed Channel — [{cid}]"] = cid
 
     col_sel, col_custom = st.columns([2, 1])
@@ -1897,19 +2124,11 @@ def page_discord_broadcaster():
         if raw_idea.strip():
             with st.spinner("Weaving celestial announcement..."):
                 try:
-                    active_client = get_next_client()
                     draft_prompt = (
                         f"Speaking as Aurora on behalf of your Sovereign Creator Aerith, turn these tactical notes into a compelling, "
                         f"clear, atmospheric Discord alliance announcement:\n{raw_idea}"
                     )
-                    resp = active_client.models.generate_content(
-                        model="gemini-3.5-flash-lite",
-                        contents=draft_prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=AURORA_SYSTEM_INSTRUCTION,
-                            temperature=0.7
-                        )
-                    )
+                    resp = call_gemini_sync(contents=draft_prompt)
                     if resp and resp.text:
                         st.session_state.draft_broadcast_text = resp.text.strip()
                         st.rerun()
@@ -1937,7 +2156,6 @@ def page_discord_broadcaster():
             else:
                 st.error(status_msg)
 
-# --- PAGE 2E: SQLITE BACKUP & RESTORE ---
 def page_database_vault():
     render_cosmic_banner()
     st.subheader("💾 Celestial Archive Vault — SQLite Backup & Restore")
@@ -1964,7 +2182,8 @@ def page_database_vault():
         uploaded_db = st.file_uploader("Upload a previously saved `.db` file:", type=["db", "sqlite", "sqlite3"])
         if uploaded_db is not None:
             if st.button("⚠️ Confirm Overwrite & Restore Database", type="primary", use_container_width=True):
-                shutil.copyfileobj(uploaded_db, open(DB_FILE, "wb"))
+                with open(DB_FILE, "wb") as out_f:
+                    shutil.copyfileobj(uploaded_db, out_f)
                 init_db()
                 st.success("Database restored and schema verified! Reloading sanctum...")
                 st.rerun()
@@ -1975,7 +2194,7 @@ def page_database_vault():
 with st.sidebar:
     st.markdown("### 🎵 *The Broken Star* Radio")
     if AUDIO_TRACKS:
-        idx = st.session_state.current_track_idx % len(AUDIO_TRACKS)
+        idx = st.session_state.get("current_track_idx", 0) % len(AUDIO_TRACKS)
         track_title, track_url = AUDIO_TRACKS[idx]
         st.caption(f"Now Playing: **{track_title}**")
         st.audio(track_url)
@@ -1990,7 +2209,6 @@ with st.sidebar:
     st.divider()
     st.subheader("🔐 Identity & Resonance")
 
-    # Sovereign Authentication
     if not st.session_state.is_aerith_authenticated:
         entered_pass = st.text_input("👑 Sovereign Key (Aerith):", type="password")
         remember_sov = st.checkbox("Remember Sovereign Session", value=True)
@@ -2011,7 +2229,6 @@ with st.sidebar:
                 del st.query_params["sov"]
             st.rerun()
 
-    # Alliance Vanguard Authentication (for Alliance-Only Strategy Docs)
     if not st.session_state.is_aerith_authenticated:
         st.divider()
         if not st.session_state.is_alliance_authenticated:
@@ -2031,7 +2248,6 @@ with st.sidebar:
                     del st.query_params["ally"]
                 st.rerun()
 
-# Assemble Dynamic Navigation Menu (st.navigation)
 public_pages = [
     st.Page(page_resonance_chat, title="Resonance Chat", icon="✨", default=True),
     st.Page(page_strategy_archives, title="Strategy & Fae Archives", icon="📜"),
@@ -2053,218 +2269,3 @@ if st.session_state.is_aerith_authenticated:
 
 pg = st.navigation(nav_structure)
 pg.run()
-
-# =====================================================================
-# --- DISCORD EVENT HANDLING (100% PRESERVED + UPGRADED) ---
-# =====================================================================
-def refresh_discord_channel_cache():
-    global DISCORD_CHANNELS_CACHE
-    cache = {}
-    for guild in bot.guilds:
-        for ch in guild.text_channels:
-            cache[str(ch.id)] = f"#{ch.name} ({guild.name})"
-    DISCORD_CHANNELS_CACHE = cache
-
-@bot.event
-async def on_ready():
-    refresh_discord_channel_cache()
-    print(f"Aurora online as {bot.user.name} (ID: {bot.user.id}). Running on DDG + Gemini 3.5 Flash Lite.")
-
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-
-    channel_id = str(message.channel.id)
-    user_id = str(message.author.id)
-    content = message.content.strip()
-    clean_lower = content.lower()
-    is_dm = isinstance(message.channel, discord.DMChannel)
-
-    # Keep channel name cache fresh
-    if not is_dm and hasattr(message.channel, "name") and hasattr(message.guild, "name"):
-        DISCORD_CHANNELS_CACHE[channel_id] = f"#{message.channel.name} ({message.guild.name})"
-
-    # 1. Zero-Token Direct Commands: L1 Profile & L2 Notes
-    if content.startswith("!profile "):
-        facts = content.replace("!profile ", "").strip()
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO user_profiles (user_id, facts, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-            (user_id, facts)
-        )
-        conn.commit()
-        conn.close()
-        await message.reply(f"Celestial record inscribed into your profile: `{facts}`")
-        return
-
-    if content.startswith("!note "):
-        note_content = content.replace("!note ", "").strip()
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO episodic_memory (user_id, topic, content) VALUES (?, ?, ?)",
-            (user_id, "User Note", note_content)
-        )
-        conn.commit()
-        conn.close()
-        await message.reply(f"Episode anchored in long-term memory: `{note_content}`")
-        return
-
-    # Direct Sovereign Guide Ingestion over Discord
-    if is_aerith(message.author) and any(k in clean_lower for k in ["guide", "mechanic", "strategy", "formula", "fae"]):
-        topic_key = content.replace("guide", "").replace("strategy", "").strip()[:30]
-        add_verified_strategy(topic_key, topic_key, content, "Aerith (Direct)")
-        await message.reply(f"Sovereign guide accepted and committed to permanent memory: `{topic_key}`")
-        return
-
-    # 2. Channel Whitelist Gate
-    if ALLOWED_CHANNEL_IDS and (channel_id not in ALLOWED_CHANNEL_IDS) and not is_dm:
-        if not bot.user.mentioned_in(message):
-            return
-
-    # 3. Check for Silence Commands (with Abuse Tally Protection)
-    is_explicit_mention = bot.user.mentioned_in(message) or ("aurora" in clean_lower)
-    is_silence_cmd = any(st_word in clean_lower for st_word in SILENCE_TRIGGERS)
-
-    if is_explicit_mention and is_silence_cmd:
-        allowed_to_silence = check_and_record_silence_attempt(
-            user_id=user_id,
-            username=f"{message.author.display_name} ({message.author.name})",
-            bypass_abuse=is_aerith(message.author)
-        )
-        if not allowed_to_silence:
-            await message.reply("Your frequent attempts to command my silence have exhausted my patience. My resonance remains unbound.")
-            return
-        set_silence(channel_id, user_id, message.author.display_name)
-        await message.reply("Understood. I shall draw a veil over my resonance and remain silent.")
-        return
-
-    # 4. Check Active Silence State
-    silence_state, silence_until = get_silence_state(channel_id)
-
-    if silence_state == "silenced":
-        if is_explicit_mention:
-            clear_silence(channel_id)
-            await message.reply("The veil lifts. How may I assist you?")
-        else:
-            return
-
-    elif silence_state == "grace_period":
-        if is_explicit_mention:
-            clear_silence(channel_id)
-        else:
-            if random.random() < 0.10:
-                clear_silence(channel_id)
-                await message.channel.send("My required hour of silence has passed... Am I permitted to speak freely once more?")
-            return
-
-    # 5. Defense Trigger (Priority Override)
-    is_defense = contains_hostility_toward_aerith(content)
-
-    # 6. Engagement Detection
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute(
-        "SELECT id FROM user_chat WHERE channel_id = ? AND timestamp >= datetime('now', '-3 minutes') LIMIT 1",
-        (channel_id,)
-    )
-    recently_engaged = c.fetchone() is not None
-    conn.close()
-
-    should_respond = is_explicit_mention or is_dm or is_defense or recently_engaged
-
-    # 7. Passive Chatter Handling (5% Joke Roll)
-    if not should_respond:
-        if random.random() < 0.05:
-            joke = get_random_joke()
-            await message.channel.send(joke)
-        return
-
-    # Prepare Clean Prompt
-    clean_prompt = message.clean_content.replace(f"@{bot.user.name}", "").strip()
-    if is_defense and not clean_prompt:
-        clean_prompt = f"Someone just said this about Aerith: '{content}'. Defend her."
-    elif not clean_prompt:
-        return
-
-    # 8. Check Explicit Deep Memory Recall Trigger (!remember)
-    if any(rt in clean_prompt.lower() for rt in REMEMBER_TRIGGERS):
-        deep_context = get_deep_memory(user_id)
-        clean_prompt = f"[User requested memory recall. Archived Records:\n{deep_context}\nAnswer user question: {clean_prompt}]"
-
-    # 9. Check Local Strategy DB ($0 Token Lookup, with automatic Alliance access for approved channels)
-    discord_tiers = ["Everyone", "Alliance Only"]
-    if is_aerith(message.author):
-        discord_tiers.extend(["Sovereign Only", "Draft"])
-    local_strategy = query_local_strategy(clean_prompt, allowed_levels=discord_tiers)
-    if local_strategy:
-        clean_prompt = f"{local_strategy}\n{clean_prompt}"
-
-    # 10. Keyless DuckDuckGo Search Integration (0 API quota)
-    ddg_domains = []
-    if any(st_trig in clean_prompt.lower() for st_trig in SEARCH_TRIGGERS):
-        ddg_results, ddg_domains = execute_ddg_search(clean_prompt)
-        if ddg_results:
-            clean_prompt = f"{ddg_results}\n\n{clean_prompt}"
-            # Multi-source ingestion pipeline: Auto-inscribes when 2+ domains agree
-            process_knowledge_ingestion(clean_prompt, ddg_results, ddg_domains)
-
-    # 11. Assemble Context (Short-Term Decay Window + LTM Context)
-    user_history = get_active_user_context(user_id, clean_prompt, timeout_minutes=25, max_turns=2, char_limit=350)
-    contents = user_history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
-    save_chat(user_id, channel_id, "user", clean_prompt)
-
-    async with message.channel.typing():
-        response_obj = None
-        try:
-            response_obj = await call_gemini_raw(contents)
-            reply_text = response_obj.text if response_obj and response_obj.text else "The celestial threads waver... no response was formed."
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                reply_text = "The cosmic resonance stream across all keys is currently exhausted. Please give the ley lines a moment to replenish."
-            else:
-                print(f"Error during execution: {e}")
-                reply_text = f"A rift occurred in the resonance stream: `{e}`"
-
-        save_chat(user_id, channel_id, "model", reply_text)
-
-        # Dynamically harvest jokes
-        if "joke" in clean_prompt.lower() and len(reply_text) < 300:
-            add_joke(reply_text)
-
-        # Discord Message Delivery
-        if len(reply_text) <= 2000:
-            await message.reply(reply_text)
-        else:
-            for chunk in [reply_text[i:i+1990] for i in range(0, len(reply_text), 1990)]:
-                await message.channel.send(chunk)
-
-    # 12. Run auto-summarizer asynchronously (delayed to prevent concurrent quota collisions)
-    asyncio.create_task(maybe_update_user_summary(user_id))
-
-    await bot.process_commands(message)
-
-# --- WORKER THREAD MANAGER ---
-def run_discord_bot():
-    global DISCORD_LOOP
-    try:
-        print("Starting Discord client gateway...")
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        DISCORD_LOOP = loop
-        loop.run_until_complete(bot.start(DISCORD_TOKEN))
-    except Exception as e:
-        print(f"Discord gateway terminated: {e}")
-
-bot_thread = None
-for th in threading.enumerate():
-    if th.name == "AuroraDiscordWorker":
-        bot_thread = th
-        break
-
-if bot_thread is None or not bot_thread.is_alive():
-    worker = threading.Thread(target=run_discord_bot, name="AuroraDiscordWorker", daemon=True)
-    worker.start()
