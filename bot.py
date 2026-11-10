@@ -22,6 +22,13 @@ import streamlit.components.v1 as components
 
 # --- STREAMLIT DASHBOARD CONFIGURATION ---
 st.set_page_config(page_title="Aurora Core — The Broken Star", page_icon="✨", layout="wide")
+hide_streamlit_style = """
+            <style>
+            #MainMenu {visibility: hidden;}
+            footer {visibility: hidden;}
+            </style>
+            """
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 
 # --- CREDENTIALS & CLIENT ROTATION POOL ---
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN") or st.secrets.get("DISCORD_TOKEN")
