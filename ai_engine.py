@@ -17,7 +17,7 @@ import requests
 from google import genai
 from google.genai import types
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 from profiles import BotProfile, get_secret_or_env
 from database import DatabaseManager
