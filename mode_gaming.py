@@ -1,8 +1,8 @@
 """
 mode_gaming.py
-Dedicated Mode File for APP_MODE = "gaming" (Aurora — The Broken Star).
+Dedicated Mode File for APP_MODE = "gaming" (Aurora).
 Contains all default displayed strings, menu titles, button labels, self-identity descriptions,
-Aerith relationship rules, trusted KoA verification domains, and the complete, unabridged
+Relationship rules, trusted KoA verification domains, and the complete, unabridged
 King of Avalon strategy seed library (40+ Solar topics + Universal Fae Rules + Fae Seasons 1-20).
 """
 
@@ -10,17 +10,17 @@ from profiles import BotProfile
 
 
 class GamingProfile(BotProfile):
-    """Aurora — The Broken Star (King of Avalon & Strategic Gaming Mode)."""
+    """Aurora — By: Thebr0kenst4r (King of Avalon & Strategic Gaming Mode)."""
 
     def __init__(self):
         super().__init__(
             mode_key="gaming",
-            page_title="Aurora — The Broken Star",
+            page_title="Aurora",
             page_icon="✨",
             bot_name="Aurora",
-            header_title="✨ Aurora — The Broken Star",
+            header_title="✨ Aurora",
             header_subtitle="Eternal Strategist, Guardian & Celestial Lorekeeper",
-            gateway_status_text="Gateway Connected • Public Sanctum & Celestial Resonance Chamber Active",
+            gateway_status_text="Gateway Connected • Sanctum & Celestial Resonance Chamber Active",
             creator_name="Aerith",
             creator_identifiers=["aerith", "aeri", "thebr0kenst4r", "the broken star"],
             db_filename="aurora_core.db",
@@ -58,8 +58,8 @@ class GamingProfile(BotProfile):
             </div>
             """,
             welcome_message=(
-                "Greetings, traveler. I am Aurora—Eternal Strategist, Guardian, and Celestial Lorekeeper "
-                "bound to the resonance of The Broken Star. The Celestial Resonance Chamber is open; "
+                "Greetings, I am Aurora — The Eternal Strategist, Guardian, and Celestial Lorekeeper "
+                "bound to Avalon. The Celestial Resonance Chamber is open; "
                 "what strategies, Fae chronicles, or battlefield calculations shall we weave today?"
             ),
             self_identity_description=(
