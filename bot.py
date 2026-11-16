@@ -1,9 +1,8 @@
 """
-bot.py
-Lightweight Main Entrypoint for Streamlit Community Cloud.
-Wires together DomainConfig (loading mode_gaming.py or mode_realtor.py + SQLite overrides),
-DatabaseManager (with GitHub 'db-vault' auto-persistence), GeminiEngine,
-DiscordWorker, Keep-Alive Self-Ping & Scheduled Auto-Backup Watchdog, and StreamlitUI.
+Smart Assistant for Thebr0kenst4r, 
+Works as an advisor for the game King of Avalon
+Beta testing my modular/oops design for additional functions.
+Working on a realtor assistant towards this end.
 """
 
 import time
@@ -32,7 +31,7 @@ st.set_page_config(
 def get_core_services(mode_key: str):
     """
     Initializes singleton backend services per mode_key so the DatabaseManager,
-    Gemini key rotation pool, DiscordWorker, and Watchdog threads persist across reruns.
+    Api key rotation pool, DiscordWorker, and Watchdog threads persist across reruns.
     """
     profile = DomainConfig.load_base_profile_from_python_file(mode_key)
     db_manager = DatabaseManager(profile)
