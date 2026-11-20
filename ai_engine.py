@@ -1,15 +1,20 @@
 """
 ai_engine.py
 Encapsulates the thread-safe Gemini API client rotation pool, retry backoff,
+multi-turn conversation history builder (with strict user/model role alternation),
+hybrid song lookup (iTunes Search API) & in-memory .m4a -> .mp3 FFmpeg transcoder,
 background rolling summarization, 4-method zero-quota web verification suite
 (DuckDuckGo Text, DuckDuckGo News, MediaWiki/Fandom API, Reddit JSON),
 trusted-domain verification, voice drafting for Discord broadcasts,
 and the Autonomous King of Avalon Update Scout.
 """
 
+import re
+import shutil
 import asyncio
 import threading
 import itertools
+import subprocess
 import urllib.parse
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional, Dict, Any
@@ -18,6 +23,11 @@ from google import genai
 from google.genai import types
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
 from ddgs import DDGS
+
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
 
 from profiles import BotProfile, get_secret_or_env
 from database import DatabaseManager
@@ -30,16 +40,123 @@ REMEMBER_TRIGGERS = ["remember", "!remember", "recall our chat", "what did we di
 INSULT_KEYWORDS = ["stupid", "idiot", "sucks", "trash", "loser", "liar", "hate", "fake", "bad", "scam", "useless"]
 SILENCE_TRIGGERS = ["be quiet", "shut up", "hush", "mute", "silence", "stop talking", "quiet"]
 
+SONG_EXPLICIT_TRIGGERS = [
+    "mp3", "m4a", "song", "music", "track", "audio", "album", "listen to", "download song", "sing"
+]
+GAME_NON_MUSIC_WORDS = [
+    "koa", "king of avalon", "kvk", "rally", "frost drake", "dragon", "troop", "march",
+    "fae", "sanctum", "alliance", "excalibur", "spire", "emblem", "hero", "golem"
+]
+
 
 def is_rate_limit_error(exception: BaseException) -> bool:
     err = str(exception)
     return "429" in err or "RESOURCE_EXHAUSTED" in err
 
 
+def is_song_request(text: str) -> bool:
+    """Detects whether the user is requesting a song/audio track without colliding with KoA terms."""
+    clean = text.lower().strip()
+    if any(g in clean for g in GAME_NON_MUSIC_WORDS) and not any(k in clean for k in ("mp3", "m4a", "song", "music", "track", "audio")):
+        return False
+    if any(k in clean for k in SONG_EXPLICIT_TRIGGERS):
+        return True
+    if re.match(r"^(play|download|find)\s+.+\s+by\s+.+", clean):
+        return True
+    return False
+
+
+def extract_song_query(text: str) -> str:
+    """Strips conversational filler so iTunes Search receives a clean artist/song title."""
+    cleaned = re.sub(
+        r"\b(hey|hi|hello|aurora|please|can you|could you|give me|get me|find|search|look up|lookup|download|direct|link|links|to|for|a|an|the|song|music|track|audio|mp3|m4a|file|files|like|mp3juice|play|listen)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"[^\w\s\-&'().]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned if len(cleaned) >= 2 else text.strip()
+
+
+def search_songs_hybrid(query: str, limit: int = 3) -> List[Dict[str, str]]:
+    """
+    Queries the free, keyless iTunes Search API for real song metadata
+    and direct downloadable .m4a audio URLs (previewUrl).
+    """
+    search_term = extract_song_query(query)
+    if not search_term:
+        return []
+
+    resp = requests.get(
+        "https://itunes.apple.com/search",
+        params={"term": search_term, "media": "music", "entity": "song", "limit": limit},
+        timeout=8,
+    )
+    resp.raise_for_status()
+
+    tracks: List[Dict[str, str]] = []
+    for item in resp.json().get("results", []):
+        m4a_url = item.get("previewUrl")
+        if not m4a_url:
+            continue
+        artist = item.get("artistName", "Unknown Artist")
+        title = item.get("trackName", "Unknown Title")
+        safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip() or "aurora_track"
+        tracks.append({
+            "track_id": str(item.get("trackId", len(tracks))),
+            "title": title,
+            "artist": artist,
+            "album": item.get("collectionName", ""),
+            "artwork": item.get("artworkUrl100", ""),
+            "m4a_url": m4a_url,
+            "store_url": item.get("trackViewUrl", ""),
+            "mp3_filename": f"{safe_name}.mp3",
+        })
+    return tracks
+
+
+def convert_m4a_url_to_mp3_bytes(m4a_url: str, bitrate: str = "192k") -> bytes:
+    """
+    Downloads a direct .m4a audio stream and transcodes it in memory
+    into playable .mp3 bytes via bundled FFmpeg (imageio-ffmpeg).
+    """
+    audio_resp = requests.get(m4a_url, timeout=15)
+    audio_resp.raise_for_status()
+
+    ffmpeg_exe = None
+    if imageio_ffmpeg is not None:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    if not ffmpeg_exe:
+        ffmpeg_exe = shutil.which("ffmpeg")
+    if not ffmpeg_exe:
+        raise RuntimeError("FFmpeg binary not available. Ensure 'imageio-ffmpeg' is in requirements.txt.")
+
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i", "pipe:0",
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-b:a", bitrate,
+        "-f", "mp3",
+        "pipe:1",
+    ]
+    proc = subprocess.run(
+        cmd,
+        input=audio_resp.content,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return proc.stdout
+
+
 class GeminiEngine:
     """
-    Thread-safe AI Engine managing key rotation, multi-source zero-quota web research,
-    trusted domain verification, voice drafting, and autonomous King of Avalon update scouting.
+    Thread-safe AI Engine managing key rotation, multi-turn history formatting,
+    multi-source zero-quota web research, trusted domain verification,
+    voice drafting, and autonomous King of Avalon update scouting.
     """
 
     def __init__(self, profile: BotProfile, db: DatabaseManager):
@@ -81,6 +198,78 @@ class GeminiEngine:
                 if td.lower() in d_clean or d_clean in td.lower():
                     return True
         return False
+
+    # --- MULTI-TURN CONVERSATION HISTORY FORMATTER ---
+
+    def build_conversation_contents(
+        self,
+        history_messages: Optional[List[Dict[str, Any]]],
+        current_prompt: str,
+        memory_context: str = "",
+        max_turns: int = 14,
+        char_limit: int = 2400
+    ) -> List[Dict[str, Any]]:
+        """
+        Converts prior conversation messages (either Streamlit session dicts or SDK contents dicts)
+        into valid, strictly alternating user/model turns for google-genai so Aurora remembers
+        multi-turn discussions and complex multi-step tasks.
+        """
+        contents: List[Dict[str, Any]] = []
+
+        if memory_context:
+            contents.append({
+                "role": "user",
+                "parts": [{"text": f"[Context & Memory Notes]\n{memory_context}"}]
+            })
+            contents.append({
+                "role": "model",
+                "parts": [{"text": "Understood. I have these records in mind."}]
+            })
+
+        if history_messages:
+            for msg in history_messages[-max_turns:]:
+                raw_role = msg.get("role", "user")
+                sdk_role = "model" if raw_role in ("assistant", "model") else "user"
+
+                if "content" in msg:
+                    text = str(msg["content"]).strip()
+                elif "parts" in msg and msg["parts"]:
+                    text = " ".join(
+                        str(p.get("text", "")) for p in msg["parts"] if isinstance(p, dict)
+                    ).strip()
+                else:
+                    text = ""
+
+                if not text:
+                    continue
+
+                if len(text) > char_limit:
+                    text = text[:char_limit] + "..."
+
+                # Gemini expects the first turn to be 'user'
+                if not contents and sdk_role == "model":
+                    contents.append({
+                        "role": "user",
+                        "parts": [{"text": "[Conversation Started]"}]
+                    })
+
+                if contents and contents[-1]["role"] == sdk_role:
+                    contents[-1]["parts"][0]["text"] += f"\n\n{text}"
+                else:
+                    contents.append({
+                        "role": sdk_role,
+                        "parts": [{"text": text}]
+                    })
+
+        if contents and contents[-1]["role"] == "user":
+            contents[-1]["parts"][0]["text"] += f"\n\n{current_prompt}"
+        else:
+            contents.append({
+                "role": "user",
+                "parts": [{"text": current_prompt}]
+            })
+
+        return contents
 
     # --- ZERO-QUOTA MULTI-SOURCE RESEARCH SUITE ($0 TOKEN / $0 API QUOTA) ---
 
@@ -380,8 +569,16 @@ class GeminiEngine:
                 )
             raise e
 
-    def call_gemini_sync(self, prompt_payload: str) -> str:
-        """Synchronous generation helper for the Streamlit Web UI with automatic fallback."""
+    def call_gemini_sync(
+        self,
+        prompt_payload: str,
+        history_messages: Optional[List[Dict[str, Any]]] = None,
+        memory_context: str = ""
+    ) -> str:
+        """
+        Synchronous generation helper for the Streamlit Web UI.
+        Accepts prior conversation turns + L1/L2 memory context so Aurora retains full multi-turn context.
+        """
         active_client = self.get_next_client()
         if not active_client:
             return "Configuration Notice: No Gemini API key found in Streamlit Secrets (`GEMINI_KEYS`)."
@@ -390,7 +587,11 @@ class GeminiEngine:
             system_instruction=self.profile.build_effective_system_prompt(),
             temperature=0.7
         )
-        contents = [{"role": "user", "parts": [{"text": prompt_payload}]}]
+        contents = self.build_conversation_contents(
+            history_messages=history_messages,
+            current_prompt=prompt_payload,
+            memory_context=memory_context
+        )
         try:
             resp = active_client.models.generate_content(
                 model="gemini-3.5-flash-lite",
