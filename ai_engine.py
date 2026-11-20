@@ -3,7 +3,7 @@ ai_engine.py
 Encapsulates the thread-safe Gemini API client rotation pool, retry backoff,
 multi-turn conversation history builder (with strict user/model role alternation),
 full-length hybrid song lookup (Local Vault -> Audius Full Tracks -> iTunes 30s Fallback)
-& in-memory FFmpeg .mp3 transcoder, background rolling summarization,
+with relevance scoring, HTTP 404 stream filtering, and in-memory FFmpeg .mp3 transcoding,
 4-method zero-quota web verification suite, trusted-domain verification,
 voice drafting for Discord broadcasts, and the Autonomous King of Avalon Update Scout.
 """
@@ -47,7 +47,7 @@ GAME_NON_MUSIC_WORDS = [
     "fae", "sanctum", "alliance", "excalibur", "spire", "emblem", "hero", "golem"
 ]
 
-_CACHED_AUDIUS_HOST: Optional[str] = None
+_CACHED_AUDIUS_HOSTS: List[str] = []
 
 
 def is_rate_limit_error(exception: BaseException) -> bool:
@@ -67,17 +67,26 @@ def is_song_request(text: str) -> bool:
     return False
 
 
-def extract_song_query(text: str) -> str:
-    """Strips conversational filler so audio search APIs receive a clean artist/song title."""
-    cleaned = re.sub(
-        r"\b(hey|hi|hello|aurora|please|can you|could you|give me|get me|find|search|look up|lookup|download|direct|link|links|to|for|a|an|the|song|music|track|audio|mp3|m4a|file|files|like|mp3juice|play|listen|full)\b",
-        " ",
-        text,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"[^\w\s\-&'().]", " ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned if len(cleaned) >= 2 else text.strip()
+def extract_song_queries(text: str) -> Tuple[str, str]:
+    """
+    Returns (primary_query, compact_query) with conversational filler and 'by' removed.
+    Example: 'Play Blue (Da Ba Dee) by Eiffel 65' -> ('Blue Da Ba Dee Eiffel 65', 'Blue Eiffel 65')
+    """
+    no_brackets = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", text)
+
+    def _clean(raw: str) -> str:
+        s = re.sub(
+            r"\b(hey|hi|hello|aurora|please|can you|could you|give me|get me|find|search|look up|lookup|download|direct|link|links|to|for|a|an|the|song|music|track|audio|mp3|m4a|file|files|like|mp3juice|play|listen|full|by|feat|ft|featuring|official|video|lyrics|radio|edit|version)\b",
+            " ",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        s = re.sub(r"[^\w\s&'-]", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    primary = _clean(text) or text.strip()
+    compact = _clean(no_brackets) or primary
+    return primary, compact
 
 
 def _format_duration(seconds: Any) -> str:
@@ -91,70 +100,101 @@ def _format_duration(seconds: Any) -> str:
         return ""
 
 
-def _get_audius_host() -> str:
-    """Discovers a healthy Audius discovery node with instant fallback to api.audius.co."""
-    global _CACHED_AUDIUS_HOST
-    if _CACHED_AUDIUS_HOST:
-        return _CACHED_AUDIUS_HOST
+def _get_audius_hosts() -> List[str]:
+    """Discovers healthy Audius discovery nodes with fallback to api.audius.co."""
+    global _CACHED_AUDIUS_HOSTS
+    if _CACHED_AUDIUS_HOSTS:
+        return _CACHED_AUDIUS_HOSTS
     try:
         r = requests.get("https://api.audius.co", timeout=4)
         if r.status_code == 200:
-            hosts = r.json().get("data", [])
-            if hosts and isinstance(hosts[0], str):
-                _CACHED_AUDIUS_HOST = hosts[0].rstrip("/")
-                return _CACHED_AUDIUS_HOST
+            hosts = [h.rstrip("/") for h in r.json().get("data", []) if isinstance(h, str)]
+            if hosts:
+                _CACHED_AUDIUS_HOSTS = hosts[:3]
+                return _CACHED_AUDIUS_HOSTS
     except Exception:
         pass
-    return "https://api.audius.co"
+    return ["https://api.audius.co"]
+
+
+def _is_stream_reachable(url: str) -> bool:
+    """Verifies that an audio URL responds with HTTP 200/206 so 404 links are never shown."""
+    if not url:
+        return False
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=4)
+        if r.status_code in (200, 206):
+            return True
+        r_get = requests.get(url, headers={"Range": "bytes=0-1"}, stream=True, timeout=5)
+        r_get.close()
+        return r_get.status_code in (200, 206)
+    except Exception:
+        return False
+
+
+def _score_track_relevance(track: Dict[str, Any], query_tokens: List[str]) -> int:
+    """Ranks tracks higher when both requested artist and title words match."""
+    if not query_tokens:
+        return 0
+    haystack = f"{track.get('title', '')} {track.get('artist', '')}".lower()
+    matched = sum(1 for tok in query_tokens if tok in haystack)
+    bonus = 2 if not track.get("is_preview", True) else 0
+    return (matched * 10) + bonus
 
 
 def _search_audius_full_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
     """Queries Audius Open Music API for full-length downloadable/streamable songs."""
-    host = _get_audius_host()
-    resp = requests.get(
-        f"{host}/v1/tracks/search",
-        params={"query": search_term, "app_name": "AuroraKoA"},
-        timeout=8,
-    )
-    resp.raise_for_status()
+    for host in _get_audius_hosts():
+        try:
+            resp = requests.get(
+                f"{host}/v1/tracks/search",
+                params={"query": search_term, "app_name": "AuroraKoA"},
+                timeout=6,
+            )
+            if resp.status_code != 200:
+                continue
 
-    tracks: List[Dict[str, Any]] = []
-    for item in resp.json().get("data", []):
-        tid = item.get("id")
-        if not tid or item.get("is_streamable") is False:
+            tracks: List[Dict[str, Any]] = []
+            for item in resp.json().get("data", []):
+                tid = item.get("id")
+                if not tid or item.get("is_streamable") is False:
+                    continue
+                title = item.get("title", "Unknown Title")
+                user_obj = item.get("user") or {}
+                artist = user_obj.get("name", "Unknown Artist")
+                artwork_obj = item.get("artwork") or {}
+                artwork_url = artwork_obj.get("150x150") or artwork_obj.get("480x480") or ""
+                duration_sec = item.get("duration", 0)
+                stream_url = f"{host}/v1/tracks/{tid}/stream?app_name=AuroraKoA"
+                safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip() or "aurora_track"
+
+                tracks.append({
+                    "track_id": f"audius_{tid}",
+                    "title": title,
+                    "artist": artist,
+                    "album": item.get("genre") or "Full Track Stream",
+                    "artwork": artwork_url,
+                    "audio_url": stream_url,
+                    "m4a_url": stream_url,
+                    "mp3_filename": f"{safe_name}.mp3",
+                    "is_preview": False,
+                    "duration_str": _format_duration(duration_sec),
+                    "source_label": "Full Track",
+                })
+                if len(tracks) >= limit * 2:
+                    break
+            if tracks:
+                return tracks
+        except Exception:
             continue
-        title = item.get("title", "Unknown Title")
-        user_obj = item.get("user") or {}
-        artist = user_obj.get("name", "Unknown Artist")
-        artwork_obj = item.get("artwork") or {}
-        artwork_url = artwork_obj.get("150x150") or artwork_obj.get("480x480") or ""
-        duration_sec = item.get("duration", 0)
-        stream_url = f"{host}/v1/tracks/{tid}/stream?app_name=AuroraKoA"
-        safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip() or "aurora_track"
-
-        tracks.append({
-            "track_id": f"audius_{tid}",
-            "title": title,
-            "artist": artist,
-            "album": item.get("genre") or "Full Track Stream",
-            "artwork": artwork_url,
-            "audio_url": stream_url,
-            "m4a_url": stream_url,
-            "mp3_filename": f"{safe_name}.mp3",
-            "is_preview": False,
-            "duration_str": _format_duration(duration_sec),
-            "source_label": "Full Track",
-        })
-        if len(tracks) >= limit:
-            break
-    return tracks
+    return []
 
 
 def _search_itunes_preview_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Fallback lookup using Apple's iTunes Search API (provides 30-second commercial previews)."""
+    """Fallback lookup using Apple's iTunes Search API (30-second commercial previews)."""
     resp = requests.get(
         "https://itunes.apple.com/search",
-        params={"term": search_term, "media": "music", "entity": "song", "limit": limit},
+        params={"term": search_term, "media": "music", "entity": "song", "limit": limit * 2},
         timeout=8,
     )
     resp.raise_for_status()
@@ -189,20 +229,29 @@ def search_songs_hybrid(
     local_media: Optional[List[Dict[str, Any]]] = None
 ) -> List[Dict[str, Any]]:
     """
-    3-Tier Song Discovery:
-    1) Checks local SQLite media_vault for direct full-length audio URLs.
-    2) Searches Audius Open Music API for full-length tracks (no 30s limit).
-    3) Falls back to iTunes Search API (30s preview) if fewer than `limit` full tracks match.
+    3-Tier Song Discovery with Relevance Ranking & HTTP 404 Filtering:
+    1) Local SQLite media_vault direct audio URLs.
+    2) Audius Open Music API full-length tracks.
+    3) iTunes Search API 30-second previews (fallback when full track isn't on Audius).
     """
-    search_term = extract_song_query(query)
-    if not search_term:
+    primary_query, compact_query = extract_song_queries(query)
+    if not primary_query:
         return []
 
-    results: List[Dict[str, Any]] = []
-    term_lower = search_term.lower()
+    query_tokens = [w.lower() for w in re.findall(r"\w+", primary_query) if len(w) >= 2]
+    candidates: List[Dict[str, Any]] = []
+    seen_ids = set()
+
+    def _add_unique(items: List[Dict[str, Any]]) -> None:
+        for t in items:
+            tid = t.get("track_id")
+            if tid and tid not in seen_ids:
+                seen_ids.add(tid)
+                candidates.append(t)
 
     # Tier 1: Local Media Vault direct audio URLs
     if local_media:
+        term_lower = compact_query.lower()
         for item in local_media:
             url = str(item.get("url", ""))
             title = str(item.get("title", ""))
@@ -211,8 +260,8 @@ def search_songs_hybrid(
                 term_lower in title.lower() or term_lower in desc.lower()
             ):
                 safe_name = re.sub(r'[\\/*?:"<>|]', "", title).strip() or "vault_track"
-                results.append({
-                    "track_id": f"vault_{item.get('id', len(results))}",
+                _add_unique([{
+                    "track_id": f"vault_{item.get('id', len(candidates))}",
                     "title": title,
                     "artist": item.get("added_by", "The Broken Star"),
                     "album": item.get("category", "Vault Archive"),
@@ -223,25 +272,33 @@ def search_songs_hybrid(
                     "is_preview": False,
                     "duration_str": "Full",
                     "source_label": "Vault Full Track",
-                })
+                }])
 
-    # Tier 2: Audius full-length open catalog
-    if len(results) < limit:
-        try:
-            audius_hits = _search_audius_full_tracks(search_term, limit=limit - len(results))
-            results.extend(audius_hits)
-        except Exception as e:
-            print(f"Audius search notice: {e}")
+    # Tier 2: Audius full-length open catalog (primary + compact query)
+    _add_unique(_search_audius_full_tracks(primary_query, limit=limit))
+    if compact_query.lower() != primary_query.lower() and len(candidates) < limit:
+        _add_unique(_search_audius_full_tracks(compact_query, limit=limit))
 
     # Tier 3: iTunes 30-second commercial preview fallback
-    if len(results) < limit:
-        try:
-            itunes_hits = _search_itunes_preview_tracks(search_term, limit=limit - len(results))
-            results.extend(itunes_hits)
-        except Exception as e:
-            print(f"iTunes fallback search notice: {e}")
+    try:
+        _add_unique(_search_itunes_preview_tracks(primary_query, limit=limit))
+        if compact_query.lower() != primary_query.lower():
+            _add_unique(_search_itunes_preview_tracks(compact_query, limit=limit))
+    except Exception as e:
+        print(f"iTunes fallback search notice: {e}")
 
-    return results[:limit]
+    # Sort by exact artist + title relevance first
+    candidates.sort(key=lambda t: _score_track_relevance(t, query_tokens), reverse=True)
+
+    # Verify HTTP reachability on top candidates so 404 streams are filtered out
+    verified: List[Dict[str, Any]] = []
+    for track in candidates[: limit + 3]:
+        if _is_stream_reachable(track.get("audio_url", "")):
+            verified.append(track)
+        if len(verified) >= limit:
+            break
+
+    return verified
 
 
 def convert_audio_url_to_mp3_bytes(
@@ -252,9 +309,8 @@ def convert_audio_url_to_mp3_bytes(
     """
     Downloads a full-length or preview audio stream and transcodes it in memory
     into playable .mp3 bytes via bundled FFmpeg (imageio-ffmpeg).
-    If max_bytes is set (e.g., for Discord upload caps), re-encodes at 112k if needed.
     """
-    audio_resp = requests.get(audio_url, timeout=30)
+    audio_resp = requests.get(audio_url, allow_redirects=True, timeout=30)
     audio_resp.raise_for_status()
 
     ffmpeg_exe = None
@@ -291,7 +347,6 @@ def convert_audio_url_to_mp3_bytes(
     return mp3_bytes
 
 
-# Backward-compatible alias
 convert_m4a_url_to_mp3_bytes = convert_audio_url_to_mp3_bytes
 
 
@@ -334,7 +389,6 @@ class GeminiEngine:
         )
 
     def is_domain_trusted(self, domains: List[str]) -> bool:
-        """Checks if any discovered domain matches the profile's trusted_domains list."""
         for d in domains:
             d_clean = d.lower()
             for td in self.profile.trusted_domains:
@@ -352,11 +406,6 @@ class GeminiEngine:
         max_turns: int = 14,
         char_limit: int = 2400
     ) -> List[Dict[str, Any]]:
-        """
-        Converts prior conversation messages (either Streamlit session dicts or SDK contents dicts)
-        into valid, strictly alternating user/model turns for google-genai so Aurora remembers
-        multi-turn discussions and complex multi-step tasks.
-        """
         contents: List[Dict[str, Any]] = []
 
         if memory_context:
@@ -413,10 +462,9 @@ class GeminiEngine:
 
         return contents
 
-    # --- ZERO-QUOTA MULTI-SOURCE RESEARCH SUITE ($0 TOKEN / $0 API QUOTA) ---
+    # --- ZERO-QUOTA MULTI-SOURCE RESEARCH SUITE ---
 
     def search_ddg_text(self, query: str, max_results: int = 3) -> Tuple[List[str], List[str]]:
-        """Method 1: Keyless DuckDuckGo general web search."""
         snippets, domains = [], []
         try:
             with DDGS() as ddgs:
@@ -435,7 +483,6 @@ class GeminiEngine:
         return snippets, domains
 
     def search_ddg_news(self, query: str, max_results: int = 2) -> Tuple[List[str], List[str]]:
-        """Method 2: Keyless DuckDuckGo live news search for recent patches & market updates."""
         snippets, domains = [], []
         try:
             with DDGS() as ddgs:
@@ -455,10 +502,6 @@ class GeminiEngine:
         return snippets, domains
 
     def search_mediawiki(self, query: str) -> Tuple[List[str], List[str]]:
-        """
-        Method 3: Keyless MediaWiki / Fandom JSON API lookup.
-        Queries the King of Avalon Fandom Wiki (in gaming mode) and Wikipedia for verified lore/stats.
-        """
         snippets, domains = [], []
         endpoints = []
         if self.profile.mode_key == "gaming":
@@ -495,9 +538,6 @@ class GeminiEngine:
         return snippets, domains
 
     def search_reddit_public(self, query: str) -> Tuple[List[str], List[str]]:
-        """
-        Method 4: Keyless Reddit Public JSON search for community-verified patch changes & discussions.
-        """
         snippets, domains = [], []
         headers = {"User-Agent": "AuroraStrategicBot/2.0"}
         try:
@@ -522,10 +562,6 @@ class GeminiEngine:
         return snippets, domains
 
     def execute_multi_source_research(self, query: str) -> Tuple[str, List[str]]:
-        """
-        Combines all 4 zero-token research channels (DDG Web, DDG News, Wiki JSON, Reddit JSON)
-        to cross-verify facts without spending any Google Search API quota.
-        """
         clean_q = query
         for trig in ["search", "lookup", "look up", "google", "verify"]:
             clean_q = clean_q.replace(trig, "")
@@ -551,12 +587,6 @@ class GeminiEngine:
         return formatted, all_domains
 
     def process_knowledge_ingestion(self, prompt: str, content: str, domains: List[str], is_sovereign_user: bool = False) -> Optional[str]:
-        """
-        Auto-inscribes knowledge into strategy_docs if:
-        1) Authored by Sovereign (Aerith), OR
-        2) Matches at least 1 Trusted Domain, OR
-        3) Corroborated by 2+ independent web domains.
-        """
         if not self.profile.enable_auto_learn and not is_sovereign_user:
             return None
 
@@ -598,11 +628,6 @@ class GeminiEngine:
     # --- AUTONOMOUS KING OF AVALON UPDATE SCOUT ---
 
     def run_koa_auto_scout(self, custom_topic: str = "") -> Tuple[bool, str]:
-        """
-        Searches across News, Wiki, and Web for new King of Avalon updates, patch notes,
-        heroes, and Fae season shifts, synthesizes verified tactical guides via Gemini,
-        and stores them automatically into strategy_docs.
-        """
         if not self.profile.enable_auto_scout and not custom_topic:
             return False, "Auto-Scout is disabled for this profile mode."
 
@@ -669,7 +694,6 @@ class GeminiEngine:
     # --- VOICE DRAFTER FOR DISCORD BROADCASTER ---
 
     def draft_in_bot_voice(self, raw_announcement: str) -> str:
-        """Rewrites a plain admin draft into Aurora's ethereal, strategic voice."""
         if not raw_announcement.strip():
             return ""
         prompt = (
@@ -717,10 +741,6 @@ class GeminiEngine:
         history_messages: Optional[List[Dict[str, Any]]] = None,
         memory_context: str = ""
     ) -> str:
-        """
-        Synchronous generation helper for the Streamlit Web UI.
-        Accepts prior conversation turns + L1/L2 memory context so Aurora retains full multi-turn context.
-        """
         active_client = self.get_next_client()
         if not active_client:
             return "Configuration Notice: No Gemini API key found in Streamlit Secrets (`GEMINI_KEYS`)."
@@ -755,7 +775,6 @@ class GeminiEngine:
             return f"A rift occurred in the resonance stream: `{e}`"
 
     async def maybe_update_user_summary(self, user_id: str) -> None:
-        """Asynchronously condenses recent user dialogue into a rolling summary after a 6s delay."""
         await asyncio.sleep(6)
         conn = self.db._get_conn()
         c = conn.cursor()
