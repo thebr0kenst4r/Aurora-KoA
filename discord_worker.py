@@ -1,9 +1,10 @@
 """
 discord_worker.py
 Encapsulates the optional Discord bot instance, event listeners (on_ready, on_message,
-on_raw_reaction_add), Zero-Token Reaction Pin Learning (📌 / 🌟 / ⭐), !learn command,
-Silence Protocol, hostility defense overrides, 4-tier hybrid song MP3 delivery with
-ownership notice, and cross-thread message broadcaster.
+on_raw_reaction_add), Zero-Token Reaction Pin Learning, !learn & !scout commands,
+Silence Protocol, hostility defense overrides, YouTube/Hybrid MP3 delivery via
+capabilities.MusicConduit, live Discord channel directory + channel name resolver,
+and cross-thread message broadcaster.
 """
 
 import io
@@ -21,10 +22,12 @@ from ai_engine import (
     SEARCH_TRIGGERS,
     REMEMBER_TRIGGERS,
     SILENCE_TRIGGERS,
+)
+from capabilities import (
     AUDIO_OWNERSHIP_NOTICE,
     is_song_request,
     search_songs_hybrid,
-    convert_audio_url_to_mp3_bytes
+    convert_track_to_mp3_bytes,
 )
 
 LEARN_REACTION_EMOJIS = {"📌", "🌟", "⭐"}
@@ -33,6 +36,7 @@ LEARN_REACTION_EMOJIS = {"📌", "🌟", "⭐"}
 class DiscordWorker:
     """
     Manages the background Discord bot gateway thread, zero-token reaction learning,
+    live channel directory (for the Web Broadcaster dropdown & channel name display),
     and thread-safe broadcasting from the Streamlit web interface.
     """
 
@@ -43,6 +47,7 @@ class DiscordWorker:
         self.token = get_secret_or_env("DISCORD_TOKEN", "")
         raw_channels = get_secret_or_env("ALLOWED_CHANNELS", "")
         self.allowed_channel_ids = [ch.strip() for ch in str(raw_channels).split(",") if ch.strip()]
+        self.channels_cache: Dict[str, Dict[str, str]] = {}
 
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.bot: Optional[commands.Bot] = None
@@ -51,6 +56,7 @@ class DiscordWorker:
             intents = discord.Intents.default()
             intents.message_content = True
             intents.reactions = True
+            intents.guilds = True
             self.bot = commands.Bot(command_prefix="!", intents=intents)
             self._register_events()
 
@@ -58,24 +64,124 @@ class DiscordWorker:
     def should_run(self) -> bool:
         return bool(self.profile.enable_discord and self.token)
 
+    def _refresh_channels_cache_from_guilds(self) -> None:
+        """Populates self.channels_cache with all accessible guild text channels."""
+        if not self.bot or not self.bot.guilds:
+            return
+        updated: Dict[str, Dict[str, str]] = {}
+        for guild in self.bot.guilds:
+            me = guild.me
+            for ch in guild.text_channels:
+                perms = ch.permissions_for(me) if me else None
+                if perms and perms.view_channel and perms.send_messages:
+                    cid = str(ch.id)
+                    updated[cid] = {
+                        "id": cid,
+                        "name": f"#{ch.name}",
+                        "guild": guild.name,
+                        "label": f"{guild.name} — #{ch.name} ({cid})",
+                    }
+        if updated:
+            self.channels_cache.update(updated)
+
+    def get_available_channels(self) -> List[Dict[str, str]]:
+        """
+        Returns a sorted list of Discord channels available for broadcasting,
+        combining live guild text channels and any ALLOWED_CHANNELS IDs from Secrets.
+        """
+        self._refresh_channels_cache_from_guilds()
+        results_by_id: Dict[str, Dict[str, str]] = dict(self.channels_cache)
+
+        for cid in self.allowed_channel_ids:
+            if cid not in results_by_id:
+                resolved_name = "Unknown Channel"
+                resolved_guild = "Configured Secret"
+                if self.bot and cid.isdigit():
+                    ch = self.bot.get_channel(int(cid))
+                    if ch is not None:
+                        resolved_name = f"#{getattr(ch, 'name', cid)}"
+                        guild_obj = getattr(ch, "guild", None)
+                        if guild_obj:
+                            resolved_guild = guild_obj.name
+                results_by_id[cid] = {
+                    "id": cid,
+                    "name": resolved_name,
+                    "guild": resolved_guild,
+                    "label": f"{resolved_guild} — {resolved_name} ({cid})",
+                }
+
+        return sorted(
+            results_by_id.values(),
+            key=lambda item: (item["guild"].lower(), item["name"].lower()),
+        )
+
+    def resolve_channel_info(self, channel_id: str) -> Dict[str, str]:
+        """
+        Resolves the human-readable channel name and server name for any Discord Channel ID.
+        """
+        cid = str(channel_id).strip()
+        if not cid:
+            return {"id": "", "name": "", "guild": ""}
+
+        if cid in self.channels_cache:
+            return self.channels_cache[cid]
+
+        if self.bot and cid.isdigit():
+            ch = self.bot.get_channel(int(cid))
+            if ch is not None:
+                guild_obj = getattr(ch, "guild", None)
+                info = {
+                    "id": cid,
+                    "name": f"#{getattr(ch, 'name', cid)}",
+                    "guild": guild_obj.name if guild_obj else "Direct Message",
+                    "label": f"{guild_obj.name if guild_obj else 'DM'} — #{getattr(ch, 'name', cid)} ({cid})",
+                }
+                self.channels_cache[cid] = info
+                return info
+
+            if self.loop and self.loop.is_running():
+                async def _fetch():
+                    fetched = await self.bot.fetch_channel(int(cid))
+                    if fetched is not None:
+                        g_obj = getattr(fetched, "guild", None)
+                        return {
+                            "id": cid,
+                            "name": f"#{getattr(fetched, 'name', cid)}",
+                            "guild": g_obj.name if g_obj else "Direct Message",
+                            "label": f"{g_obj.name if g_obj else 'DM'} — #{getattr(fetched, 'name', cid)} ({cid})",
+                        }
+                    return None
+
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(_fetch(), self.loop)
+                    fetched_info = fut.result(timeout=4)
+                    if fetched_info:
+                        self.channels_cache[cid] = fetched_info
+                        return fetched_info
+                except Exception:
+                    pass
+
+        return {
+            "id": cid,
+            "name": "Pending Gateway / Unresolved Channel",
+            "guild": "Discord",
+            "label": f"Discord — ({cid})",
+        }
+
     def _register_events(self) -> None:
         if not self.bot:
             return
 
         @self.bot.event
         async def on_ready():
+            self._refresh_channels_cache_from_guilds()
             print(
                 f"{self.profile.bot_name} online as {self.bot.user.name} (ID: {self.bot.user.id}). "
-                f"Mode: {self.profile.mode_key} | Multi-Source Research + Reaction Learning Active."
+                f"Mode: {self.profile.mode_key} | Channels Indexed: {len(self.channels_cache)}."
             )
 
         @self.bot.event
         async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-            """
-            Zero-Token Reaction Learning:
-            When Sovereign (Aerith) reacts to any Discord message with 📌, 🌟, or ⭐,
-            Aurora automatically saves that message into strategy_docs at $0 token cost.
-            """
             if not self.bot or not self.profile.enable_auto_learn:
                 return
             emoji_str = str(payload.emoji)
@@ -106,7 +212,7 @@ class DiscordWorker:
                     content=raw_text,
                     verified_by=f"{self.profile.creator_name} (Discord {emoji_str} Reaction Pin)",
                     category="Sovereign Pin",
-                    access_tier="Everyone"
+                    access_tier="Everyone",
                 )
                 await msg.add_reaction("✨")
             except Exception as e:
@@ -126,7 +232,7 @@ class DiscordWorker:
             is_dm = isinstance(message.channel, discord.DMChannel)
             is_sov = self.engine.is_sovereign(message.author.name, message.author.display_name)
 
-            # 1. Zero-Token Direct Commands (!profile, !note, !learn, !scout)
+            # 1. Zero-Token Direct Commands
             if content.startswith("!profile "):
                 facts = content.replace("!profile ", "").strip()
                 self.db.update_l1_profile(user_id, facts)
@@ -151,7 +257,7 @@ class DiscordWorker:
                     content=content_part,
                     verified_by=f"{self.profile.creator_name} (!learn Command)",
                     category="Sovereign Strategy",
-                    access_tier="Everyone"
+                    access_tier="Everyone",
                 )
                 await message.reply(f"✨ Inscribed into Permanent Strategy Archives: **{topic_part.title()}**")
                 return
@@ -163,12 +269,13 @@ class DiscordWorker:
                 await message.reply(f"✨ **Scout Complete:** {report}")
                 return
 
-            # Sovereign direct strategy ingestion
             if is_sov and self.profile.enable_auto_learn and any(k in clean_lower for k in ["guide:", "mechanic:", "strategy:", "formula:"]):
                 topic_key = content.split(":", 1)[0].strip()[:30]
                 self.db.add_verified_strategy(
-                    topic_key, topic_key.title(), content,
-                    f"{self.profile.creator_name} (Direct Discord)"
+                    topic_key,
+                    topic_key.title(),
+                    content,
+                    f"{self.profile.creator_name} (Direct Discord)",
                 )
                 await message.reply(f"Sovereign guide accepted and committed to permanent memory: `{topic_key}`")
                 return
@@ -205,7 +312,7 @@ class DiscordWorker:
                         await message.channel.send("My required hour of silence has passed... Am I permitted to speak freely once more?")
                     return
 
-            # 5. Defense Trigger Override (Hostility toward Creator)
+            # 5. Defense Trigger Override
             is_defense = self.engine.contains_hostility_toward_creator(content)
             if is_defense:
                 self.db.record_abuse_offense(user_id, f"{message.author.name}")
@@ -230,12 +337,12 @@ class DiscordWorker:
             elif not clean_prompt:
                 return
 
-            # 8. Deep Memory Recall Trigger (!remember)
+            # 8. Deep Memory Recall Trigger
             if any(rt in clean_prompt.lower() for rt in REMEMBER_TRIGGERS):
                 deep_context = self.db.get_deep_memory(user_id)
                 clean_prompt = f"[User requested memory recall. Archived Records:\n{deep_context}\nAnswer user question: {clean_prompt}]"
 
-            # 9. Local Strategy DB Lookup ($0 Token Lookup)
+            # 9. Local Strategy DB Lookup
             allowed_tiers = ["Everyone", "Alliance Only", "Sovereign Only"] if is_sov else ["Everyone", "Alliance Only"]
             local_strategy = self.db.query_local_docs(clean_prompt, allowed_tiers=allowed_tiers)
             if local_strategy:
@@ -248,7 +355,7 @@ class DiscordWorker:
                     clean_prompt = f"{research_text}\n\n{clean_prompt}"
                     self.engine.process_knowledge_ingestion(clean_prompt, research_text, domains, is_sovereign_user=is_sov)
 
-            # 10b. 4-Tier Hybrid Song Lookup & Playable MP3 Attachment for Discord
+            # 10b. YouTube + Hybrid Song Lookup & Playable MP3 Attachment for Discord
             discord_mp3_file: Optional[discord.File] = None
             matched_tracks: List[Dict[str, Any]] = []
             if is_song_request(raw_user_text):
@@ -257,20 +364,19 @@ class DiscordWorker:
                         search_songs_hybrid,
                         raw_user_text,
                         2,
-                        self.db.get_all_media()
+                        self.db.get_all_media(),
                     )
                     if matched_tracks:
                         top_track = matched_tracks[0]
-                        stream_url = top_track.get("audio_url") or top_track.get("m4a_url", "")
                         mp3_bytes = await asyncio.to_thread(
-                            convert_audio_url_to_mp3_bytes,
-                            stream_url,
+                            convert_track_to_mp3_bytes,
+                            top_track,
                             "192k",
-                            7_500_000
+                            7_500_000,
                         )
                         discord_mp3_file = discord.File(
                             io.BytesIO(mp3_bytes),
-                            filename=top_track["mp3_filename"]
+                            filename=top_track["mp3_filename"],
                         )
                         clean_prompt = (
                             f"[SYSTEM AUDIO ATTACHMENT — Playable MP3 file '{top_track['mp3_filename']}' "
@@ -295,18 +401,18 @@ class DiscordWorker:
                     f"{clean_prompt}"
                 )
 
-            # 12. Assemble Expanded Multi-Turn Context & Generate
+            # 12. Assemble Multi-Turn Context & Generate
             user_history = self.db.get_active_user_context(
                 user_id,
                 raw_user_text,
                 timeout_minutes=120,
                 max_turns=14,
-                char_limit=1800
+                char_limit=1800,
             )
             contents = self.engine.build_conversation_contents(
                 history_messages=user_history,
                 current_prompt=clean_prompt,
-                max_turns=14
+                max_turns=14,
             )
             self.db.save_chat(user_id, channel_id, "user", raw_user_text)
 
@@ -335,7 +441,7 @@ class DiscordWorker:
                     else:
                         await message.reply(reply_text)
                 else:
-                    chunks = [reply_text[i:i + 1990] for i in range(0, len(reply_text), 1990)]
+                    chunks = [reply_text[i : i + 1990] for i in range(0, len(reply_text), 1990)]
                     for idx, chunk in enumerate(chunks):
                         if idx == 0 and discord_mp3_file:
                             await message.reply(chunk, file=discord_mp3_file)
@@ -346,7 +452,6 @@ class DiscordWorker:
             await self.bot.process_commands(message)
 
     def start_background_thread(self) -> None:
-        """Starts the Discord gateway daemon thread if enabled and not already running."""
         if not self.should_run:
             return
 
@@ -368,7 +473,6 @@ class DiscordWorker:
         worker.start()
 
     def send_broadcast(self, channel_id: str, message_text: str) -> Tuple[bool, str]:
-        """Thread-safely dispatches an announcement message to a Discord channel from Streamlit."""
         if not self.should_run or not self.bot or not self.loop:
             return False, "Discord worker is not active in this mode."
 

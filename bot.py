@@ -1,42 +1,71 @@
 """
-Smart Assistant for Thebr0kenst4r, 
-Works as an advisor for the game King of Avalon
-Beta testing my modular/oops design for additional functions.
-Working on a realtor assistant towards this end.
+bot.py
+Smart Assistant for Thebr0kenst4r (Aurora — Gaming Mode & Aria — Realtor Mode).
+Lightweight Streamlit + Discord + Watchdog entrypoint orchestrating:
+- Global site-wide persistent mode switching (DomainConfig)
+- Isolated per-mode SQLite databases (DatabaseManager)
+- Shared cross-mode capabilities (capabilities/) & modular mode subpackages (modes/)
 """
 
+import os
+import json
 import time
 import threading
 import urllib.request
 import streamlit as st
 
-from profiles import DomainConfig
-from database import DatabaseManager
+from profiles import DomainConfig, SITE_STATE_FILE, get_deployment_namespace
+from database import DatabaseManager, GitHubVaultSync
 from ai_engine import GeminiEngine
 from discord_worker import DiscordWorker
 from web_ui import StreamlitUI
 
-# 1. Load the base Python profile for initial page config
-initial_mode_key = DomainConfig.get_active_mode_key()
-base_profile = DomainConfig.load_base_profile_from_python_file(initial_mode_key)
+
+@st.cache_resource
+def _bootstrap_global_site_state() -> bool:
+    """
+    On fresh container boot, restores site_state.json from GitHub db-vault
+    (namespaced per deployment) so any Sovereign mode switch persists across reboots.
+    """
+    if not os.path.exists(SITE_STATE_FILE):
+        vault = GitHubVaultSync("site_state")
+        if vault.is_configured:
+            ns = get_deployment_namespace()
+            ok, msg = vault.pull_file_from_vault(f"backups/site_state_{ns}.json", SITE_STATE_FILE)
+            print(f"[Global Site State Boot Check - {ns}] {msg}")
+            if ok and os.path.exists(SITE_STATE_FILE):
+                try:
+                    with open(SITE_STATE_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, dict) and data.get("active_mode"):
+                            DomainConfig.set_active_mode_key(data["active_mode"], db=None)
+                except Exception as e:
+                    print(f"[Global Site State Parse Notice]: {e}")
+    return True
+
+
+_bootstrap_global_site_state()
+
+active_mode_key = DomainConfig.get_active_mode_key()
+base_profile = DomainConfig.load_base_profile_from_python_file(active_mode_key)
 
 st.set_page_config(
     page_title=base_profile.page_title,
     page_icon=base_profile.page_icon,
-    layout="wide"
+    layout="wide",
 )
 
 
 @st.cache_resource
 def get_core_services(mode_key: str):
     """
-    Initializes singleton backend services per mode_key so the DatabaseManager,
-    Api key rotation pool, DiscordWorker, and Watchdog threads persist across reruns.
+    Initializes singleton backend services per mode_key so each mode maintains
+    its own isolated SQLite database (aurora_core.db vs realtor_core.db),
+    API key rotation pool, DiscordWorker, and Watchdog threads.
     """
     profile = DomainConfig.load_base_profile_from_python_file(mode_key)
     db_manager = DatabaseManager(profile)
 
-    # Apply any admin overrides saved in SQLite on top of the Python file defaults
     overrides = db_manager.get_mode_override(mode_key)
     if overrides:
         profile.apply_overrides(overrides)
@@ -44,10 +73,8 @@ def get_core_services(mode_key: str):
     ai_engine = GeminiEngine(profile, db_manager)
     discord_worker = DiscordWorker(profile, db_manager, ai_engine)
 
-    # 1. Start Discord gateway thread if enabled
     discord_worker.start_background_thread()
 
-    # 2. Start Autonomous King of Avalon Update Scout (every 12 hours if enabled)
     def _periodic_koa_scout():
         time.sleep(60)
         while True:
@@ -61,29 +88,26 @@ def get_core_services(mode_key: str):
     if not any(t.name == f"KoAScout_{mode_key}" and t.is_alive() for t in threading.enumerate()):
         threading.Thread(target=_periodic_koa_scout, name=f"KoAScout_{mode_key}", daemon=True).start()
 
-    # 3. Start Zero-Token Keep-Alive Self-Ping & Scheduled GitHub Backup Watchdog
     def _watchdog_keepalive_and_backup():
         last_backup_ts = time.time()
         while True:
-            time.sleep(600)  # Wake every 10 minutes
-            # (a) Zero-Token HTTP Keep-Alive Ping so Streamlit Cloud doesn't sleep
+            time.sleep(600)
             if profile.enable_keep_alive_ping and profile.app_public_url:
                 try:
                     req = urllib.request.Request(
                         profile.app_public_url,
-                        headers={"User-Agent": "AuroraKeepAliveWatchdog/2.0"}
+                        headers={"User-Agent": "AuroraKeepAliveWatchdog/2.0"},
                     )
                     urllib.request.urlopen(req, timeout=10)
                 except Exception:
                     pass
 
-            # (b) Scheduled Periodic GitHub 'db-vault' Backup
             interval_sec = max(1800.0, float(profile.backup_interval_hours) * 3600.0)
             if (time.time() - last_backup_ts) >= interval_sec:
                 last_backup_ts = time.time()
                 db_manager.trigger_background_sync(
                     force=True,
-                    reason=f"Scheduled {profile.backup_interval_hours}h Auto-Backup"
+                    reason=f"Scheduled {profile.backup_interval_hours}h Auto-Backup",
                 )
 
     if not any(t.name == f"Watchdog_{mode_key}" and t.is_alive() for t in threading.enumerate()):
@@ -92,19 +116,17 @@ def get_core_services(mode_key: str):
     return db_manager, ai_engine, discord_worker
 
 
-# 2. Acquire Backend Services & Apply Latest SQLite Mode Overrides
-db_service, engine_service, discord_service = get_core_services(initial_mode_key)
-active_profile = DomainConfig.load_profile(initial_mode_key, db=db_service)
+db_service, engine_service, discord_service = get_core_services(active_mode_key)
+active_profile = DomainConfig.load_profile(active_mode_key, db=db_service)
 
 db_service.profile = active_profile
 engine_service.profile = active_profile
 discord_service.profile = active_profile
 
-# 3. Render Streamlit Multi-Page UI
 app_ui = StreamlitUI(
     profile=active_profile,
     db=db_service,
     engine=engine_service,
-    discord_worker=discord_service
+    discord_worker=discord_service,
 )
 app_ui.run()

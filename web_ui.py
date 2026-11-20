@@ -1,13 +1,12 @@
 """
 web_ui.py
 Encapsulates the Streamlit multi-page application, multi-turn conversation memory,
-4-tier full-length hybrid song lookup (Local Vault -> Audius -> Internet Archive -> iTunes 30s Fallback)
-with 1-click convert to playable/downloadable .mp3 and ownership notice,
-6-Element KoA March & Planar Synergy Calculator (Fire, Ice, Wind, Earth, Light, Dark),
-separated Alliance (top) & Sovereign (bottom) sidebar authentication,
-customized Gaming/Realtor titles & strings, double-click st.data_editor tables,
-the Interactive Mode, String & Persona Studio (with 1-click fallback to Python mode files),
-"Draft in Aurora's Voice" Discord broadcaster, and 1-click Project .zip Exporter.
+shared YouTube + Hybrid MP3 music capability across all modes,
+delegated modular domain calculators (modes/gaming/march_calculator.py &
+modes/realtor/payment_calculator.py), site-wide persistent mode switching,
+restored Discord Broadcaster Channel Dropdown + dedicated Channel Name field,
+double-click st.data_editor tables, Interactive Mode/String/Persona Studio,
+and 1-click Modular Project .zip Exporter.
 """
 
 import os
@@ -22,12 +21,14 @@ from profiles import BotProfile, DomainConfig, get_secret_or_env
 from database import DatabaseManager
 from ai_engine import (
     GeminiEngine,
-    SEARCH_TRIGGERS,
     REMEMBER_TRIGGERS,
+)
+from capabilities import (
+    SEARCH_TRIGGERS,
     AUDIO_OWNERSHIP_NOTICE,
     is_song_request,
     search_songs_hybrid,
-    convert_audio_url_to_mp3_bytes
+    convert_track_to_mp3_bytes,
 )
 from discord_worker import DiscordWorker
 
@@ -35,7 +36,8 @@ from discord_worker import DiscordWorker
 class StreamlitUI:
     """
     Object-Oriented Streamlit UI Controller.
-    Adapts branding, navigation, calculators, and admin studios dynamically based on BotProfile.
+    Adapts branding, navigation, modular calculators, and admin studios dynamically
+    based on the active global BotProfile.
     """
 
     def __init__(self, profile: BotProfile, db: DatabaseManager, engine: GeminiEngine, discord_worker: DiscordWorker):
@@ -99,13 +101,11 @@ class StreamlitUI:
             st.markdown(banner, unsafe_allow_html=True)
 
     def _render_track_cards(self, tracks: List[Dict[str, Any]], msg_index: int) -> None:
-        """
-        Renders each matched song with its source badge, inline audio player,
-        and side-by-side Direct Stream + Convert to MP3 / Download MP3 buttons.
-        """
         for idx, track in enumerate(tracks):
             tid = str(track.get("track_id", f"{msg_index}_{idx}"))
+            extractor = track.get("extractor", "http")
             stream_url = track.get("audio_url") or track.get("m4a_url", "")
+            link_url = track.get("webpage_url") or stream_url
             is_preview = bool(track.get("is_preview", False))
             dur = track.get("duration_str", "")
             src_label = track.get("source_label", "Full Track")
@@ -122,17 +122,19 @@ class StreamlitUI:
                     if track.get("album"):
                         st.caption(track["album"])
 
-                st.audio(stream_url, format=audio_fmt)
+                if extractor != "ytdlp" and stream_url:
+                    st.audio(stream_url, format=audio_fmt)
 
                 btn_col1, btn_col2 = st.columns(2)
                 with btn_col1:
-                    st.link_button("🔗 Direct Stream", stream_url, width="stretch")
+                    link_label = "▶️ Open Source Video/Stream" if extractor == "ytdlp" else "🔗 Direct Stream"
+                    st.link_button(link_label, link_url, width="stretch")
                 with btn_col2:
                     if tid not in st.session_state.converted_mp3s:
                         if st.button("🎵 Convert to MP3", key=f"conv_mp3_{msg_index}_{idx}_{tid}", width="stretch"):
-                            with st.spinner("Downloading & encoding playable MP3..."):
+                            with st.spinner("Extracting & encoding playable MP3 via FFmpeg..."):
                                 try:
-                                    mp3_bytes = convert_audio_url_to_mp3_bytes(stream_url)
+                                    mp3_bytes = convert_track_to_mp3_bytes(track)
                                     st.session_state.converted_mp3s[tid] = mp3_bytes
                                     st.rerun()
                                 except Exception as conv_err:
@@ -149,27 +151,22 @@ class StreamlitUI:
                         file_name=track.get("mp3_filename", "track.mp3"),
                         mime="audio/mpeg",
                         key=f"dl_mp3_{msg_index}_{idx}_{tid}",
-                        width="stretch"
+                        width="stretch",
                     )
 
     def render_sidebar_auth(self) -> None:
-        """
-        Renders the Sidebar with Alliance Key Access at the top and
-        Sovereign Sanctum Login separated cleanly at the bottom.
-        """
         with st.sidebar:
             st.subheader(self.profile.get_str("sidebar_header", "Identity & Resonance"))
 
             if st.session_state.auth_role == "Guest":
                 st.info(self.profile.get_str("guest_badge", "Browsing Public Sanctum as Guest"))
 
-                # TOP SECTION: Alliance Key Access
                 with st.container(border=True):
                     st.markdown(f"**{self.profile.get_str('alliance_section_title', '🛡️ Alliance Key Access')}**")
                     alliance_pass = st.text_input(
                         self.profile.get_str("alliance_login_prompt", "Enter Alliance Resonance Key:"),
                         type="password",
-                        key="sidebar_alliance_pass"
+                        key="sidebar_alliance_pass",
                     )
                     if st.button(self.profile.get_str("alliance_login_button", "Attune Alliance Access"), width="stretch"):
                         if alliance_pass == self.alliance_key:
@@ -183,12 +180,11 @@ class StreamlitUI:
                         else:
                             st.error("Alliance key mismatch.")
 
-                # BOTTOM SECTION: Sovereign Sanctum Login
                 with st.expander(self.profile.get_str("sovereign_section_title", "👑 Sovereign Sanctum Login"), expanded=False):
                     sov_pass = st.text_input(
                         self.profile.get_str("sovereign_login_prompt", "Enter Sovereign Creator Key:"),
                         type="password",
-                        key="sidebar_sovereign_pass"
+                        key="sidebar_sovereign_pass",
                     )
                     if st.button(self.profile.get_str("sovereign_login_button", "Awaken Sovereign Command"), width="stretch"):
                         if sov_pass == self.sovereign_key:
@@ -210,7 +206,7 @@ class StreamlitUI:
                         sov_pass = st.text_input(
                             self.profile.get_str("sovereign_login_prompt", "Enter Sovereign Creator Key:"),
                             type="password",
-                            key="sidebar_sovereign_elevate"
+                            key="sidebar_sovereign_elevate",
                         )
                         if st.button(self.profile.get_str("sovereign_login_button", "Awaken Sovereign Command"), width="stretch"):
                             if sov_pass == self.sovereign_key:
@@ -227,27 +223,25 @@ class StreamlitUI:
 
             if self.is_admin:
                 st.divider()
-                st.caption("🎛️ **Admin Mode Switcher**")
+                st.caption("🎛️ **Site-Wide Mode Switcher (Applies to Everyone)**")
                 custom_keys = self.db.get_all_custom_mode_keys()
                 modes = DomainConfig.get_available_modes(custom_keys)
                 current_idx = modes.index(self.profile.mode_key) if self.profile.mode_key in modes else 0
                 selected_mode = st.selectbox(
-                    "Active Deployment Mode:",
+                    "Active Site Mode:",
                     options=modes,
                     index=current_idx,
-                    key="sidebar_mode_select"
+                    key="sidebar_mode_select",
                 )
                 if selected_mode != self.profile.mode_key:
-                    st.session_state.session_app_mode_override = selected_mode
+                    DomainConfig.set_active_mode_key(selected_mode, db=self.db)
                     st.rerun()
 
+                st.caption(f"🗄️ Mode DB: `{self.db.db_file}`")
                 if self.db.vault.is_configured:
                     st.caption(f"☁️ **GitHub Vault:** `{self.db.vault.branch}`")
                     st.caption(f"Status: {self.db.vault.last_sync_status}")
 
-    # =========================================================================
-    # PAGE 1: CELESTIAL RESONANCE CHAMBER (Chat)
-    # =========================================================================
     def page_resonance_chat(self) -> None:
         self.render_banner()
         col_h, col_btn = st.columns([3, 1])
@@ -263,7 +257,6 @@ class StreamlitUI:
                 st.session_state.chat_cleared_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 st.rerun()
 
-        # Render full conversation history + any attached song cards
         for idx, msg in enumerate(st.session_state.web_messages):
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
@@ -278,7 +271,6 @@ class StreamlitUI:
 
             web_uid = self.active_web_user_id
 
-            # Zero-token direct memory commands in web chat (!profile / !note)
             if user_input.startswith("!profile "):
                 facts = user_input.replace("!profile ", "").strip()
                 self.db.update_l1_profile(web_uid, facts)
@@ -305,7 +297,7 @@ class StreamlitUI:
                     topic_key.title(),
                     user_input,
                     f"{self.profile.creator_name} (Web Direct)",
-                    category="Sovereign Strategy"
+                    category="Sovereign Strategy",
                 )
                 st.toast(f"✨ Inscribed into Permanent Knowledge Records: {topic_key}")
 
@@ -330,15 +322,14 @@ class StreamlitUI:
                         if inscribed:
                             st.toast(f"🌐 Auto-verified & inscribed: {inscribed}")
 
-            # 4-Tier Full-Length Song Lookup + 1-Click MP3 Conversion
             found_tracks: List[Dict[str, Any]] = []
             if is_song_request(user_input):
-                with st.status("🎵 Searching celestial audio archives...", expanded=False):
+                with st.status("🎵 Engaging acoustic conduit & searching audio archives...", expanded=False):
                     try:
                         found_tracks = search_songs_hybrid(
                             user_input,
                             limit=3,
-                            local_media=self.db.get_all_media()
+                            local_media=self.db.get_all_media(),
                         )
                     except Exception as song_err:
                         st.toast(f"Audio search notice: {song_err}")
@@ -352,12 +343,12 @@ class StreamlitUI:
                         "[SYSTEM AUDIO ATTACHMENT — Interactive player cards for ONLY these verified tracks render directly below your reply:\n"
                         f"{track_lines}\n"
                         "STRICT RULE: Do NOT output any URLs, hyperlinks, or [text](url) Markdown links in your text reply. "
-                        "List the exact titles above in character and let the user know they can play the stream or click 'Convert to MP3' right below.]"
+                        "List the exact titles above in character and let the user know they can click 'Convert to MP3' right below.]"
                     )
                 else:
                     prompt_parts.append(
-                        "[SYSTEM AUDIO NOTICE: No verified playable open/vault stream was found for this song query. "
-                        "STRICT RULE: Do NOT invent, guess, or output any URLs or links. Apologize briefly in character and ask for the exact artist and song title, or suggest adding a direct MP3 link to the Media Vault.]"
+                        "[SYSTEM AUDIO NOTICE: No verified playable stream was found for this song query. "
+                        "STRICT RULE: Do NOT invent, guess, or output any URLs or links. Apologize briefly in character and ask for the exact artist/title or YouTube link.]"
                     )
 
             if self.is_admin:
@@ -378,7 +369,7 @@ class StreamlitUI:
                     timeout_minutes=120,
                     max_turns=12,
                     char_limit=1800,
-                    since_timestamp=st.session_state.chat_cleared_at
+                    since_timestamp=st.session_state.chat_cleared_at,
                 )
                 history_for_model = db_turns
             else:
@@ -389,7 +380,7 @@ class StreamlitUI:
                     web_reply = self.engine.call_gemini_sync(
                         prompt_payload=prompt_payload,
                         history_messages=history_for_model,
-                        memory_context=ltm_context
+                        memory_context=ltm_context,
                     )
                     if found_tracks and "Audio Notice:" not in web_reply:
                         web_reply = f"{web_reply}{AUDIO_OWNERSHIP_NOTICE}"
@@ -407,9 +398,6 @@ class StreamlitUI:
                     self.db.save_chat(web_uid, "streamlit_web", "user", user_input)
                     self.db.save_chat(web_uid, "streamlit_web", "model", web_reply)
 
-    # =========================================================================
-    # PAGE 2: STRATEGIES & LORE ARCHIVES
-    # =========================================================================
     def page_strategy_archives(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("archives_header", "Celestial Strategy & Fae Archives"))
@@ -422,7 +410,7 @@ class StreamlitUI:
 
         col1, col2 = st.columns([2, 1])
         with col1:
-            search_q = st.text_input("🔍 Filter by keyword, Fae season, event, or content:", "")
+            search_q = st.text_input("🔍 Filter by keyword, season, event, or content:", "")
         with col2:
             categories = ["All Categories"] + sorted(list({d["category"] for d in docs}))
             selected_cat = st.selectbox("📂 Category:", categories)
@@ -438,158 +426,18 @@ class StreamlitUI:
             )
         ]
 
-        st.caption(f"Showing **{len(filtered)}** verified record(s).")
+        st.caption(f"Showing **{len(filtered)}** verified record(s) from `{self.db.db_file}`.")
         for d in filtered:
             with st.expander(f"📌 **{d['topic']}**  —  `{d['category']}` | Tier: `{d['access_tier']}`"):
                 st.markdown(d["content"])
                 st.caption(f"Keyword: `{d['keyword']}` • Verified by: **{d['verified_by']}** • Updated: `{d['timestamp']}`")
 
-    # =========================================================================
-    # PAGE 3: MARCH OF SYNERGY / MORTGAGE CALCULATOR
-    # =========================================================================
     def page_domain_calculator(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("calc_header", "March of Synergy & Elemental Calculator"))
-        st.caption(self.profile.get_str("calc_caption", "Interactive formation and synergy calculator."))
+        st.caption(self.profile.get_str("calc_caption", "Interactive domain calculator."))
+        self.profile.render_calculator()
 
-        if self.profile.calculator_type == "realtor_mortgage":
-            self._render_realtor_mortgage_calculator()
-        else:
-            self._render_gaming_march_calculator()
-
-    def _render_gaming_march_calculator(self) -> None:
-        col1, col2 = st.columns(2)
-        with col1:
-            march_cap = st.number_input("Total March Capacity (Troops):", min_value=1000, max_value=10000000, value=350000, step=10000)
-            preset = st.selectbox(
-                "Tactical Formation Preset:",
-                [
-                    "Standard Balanced Rally (45% Inf / 27% Cav / 28% Bow)",
-                    "Heavy Sanctum / Garrison Anchor (55% Inf / 20% Cav / 25% Bow)",
-                    "High-Burst Flank Strike (38% Inf / 35% Cav / 27% Bow)",
-                    "Light / Dark Planar Burst (42% Inf / 30% Cav / 28% Bow)",
-                    "Golem / Single-Target Boss (1% Inf / 44% Cav / 55% Bow)",
-                    "Custom Ratio"
-                ]
-            )
-        with col2:
-            element_options = ["Fire 🔥", "Ice ❄️", "Wind 🌪️", "Earth 🪨", "Light ☀️", "Dark 🌑"]
-            my_element = st.selectbox("Your Primary Planar Element:", element_options)
-            enemy_element = st.selectbox("Target / Enemy Element:", element_options)
-
-        if "Standard" in preset:
-            inf_pct, cav_pct, bow_pct = 45, 27, 28
-        elif "Heavy" in preset:
-            inf_pct, cav_pct, bow_pct = 55, 20, 25
-        elif "High-Burst" in preset:
-            inf_pct, cav_pct, bow_pct = 38, 35, 27
-        elif "Planar Burst" in preset:
-            inf_pct, cav_pct, bow_pct = 42, 30, 28
-        elif "Golem" in preset:
-            inf_pct, cav_pct, bow_pct = 1, 44, 55
-        else:
-            c1, c2, c3 = st.columns(3)
-            inf_pct = c1.slider("Infantry %", 1, 85, 45)
-            cav_pct = c2.slider("Cavalry %", 1, 80, 27)
-            bow_pct = max(0, 100 - inf_pct - cav_pct)
-            c3.metric("Bowmen % (Auto-balanced)", f"{bow_pct}%")
-
-        inf_count = int(march_cap * (inf_pct / 100.0))
-        cav_count = int(march_cap * (cav_pct / 100.0))
-        bow_count = march_cap - inf_count - cav_count
-
-        st.subheader("🛡️ Computed Troop Allocation (Primary Tier vs. Cushion Tier)")
-        m1, m2, m3 = st.columns(3)
-        m1.metric("🛡️ Infantry Frontline", f"{inf_count:,}", f"{inf_pct}% (Main: {int(inf_count*0.75):,} | Cushion: {int(inf_count*0.25):,})")
-        m2.metric("🐎 Cavalry Flank", f"{cav_count:,}", f"{cav_pct}% (Main: {int(cav_count*0.75):,} | Cushion: {int(cav_count*0.25):,})")
-        m3.metric("🏹 Bowmen Backline", f"{bow_count:,}", f"{bow_pct}% (Main: {int(bow_count*0.80):,} | Cushion: {int(bow_count*0.20):,})")
-
-        # 6-Element KoA Planar Resonance & Counter Evaluation
-        primal_counters = {
-            "Ice ❄️": "Fire 🔥",
-            "Fire 🔥": "Wind 🌪️",
-            "Wind 🌪️": "Earth 🪨",
-            "Earth 🪨": "Ice ❄️",
-        }
-        celestial_pair = {"Light ☀️", "Dark 🌑"}
-
-        if {my_element, enemy_element} == celestial_pair:
-            st.warning(
-                f"⚡ **Celestial Duality Clash ({my_element} ↔ {enemy_element}):** "
-                "Light and Dark mutually counter each other with amplified Planar Damage! "
-                "Both marches deal heightened burst—reinforce Infantry frontline (+3–5%) and prioritize Planar Resistance & Penetration."
-            )
-        elif my_element in celestial_pair and enemy_element not in celestial_pair:
-            st.success(
-                f"✨ **Transcendent Planar Advantage ({my_element} vs {enemy_element}):** "
-                f"{my_element} sits outside the 4-element primal cycle—immune to primal counter penalties while retaining full Planar Resonance."
-            )
-        elif enemy_element in celestial_pair and my_element not in celestial_pair:
-            st.info(
-                f"🌌 **Primal vs. Celestial Matchup ({my_element} vs {enemy_element}):** "
-                f"{enemy_element} bypasses standard primal counter disadvantages. Rely on raw troop stats, Planar Resistance, and frontline cushion."
-            )
-        elif primal_counters.get(my_element) == enemy_element:
-            st.success(
-                f"🌟 **Elemental Advantage Active ({my_element} counters {enemy_element}):** "
-                "+15% Planar Damage & Mitigation resonance!"
-            )
-        elif primal_counters.get(enemy_element) == my_element:
-            st.warning(
-                f"⚠️ **Elemental Disadvantage ({enemy_element} counters {my_element}):** "
-                "Increase Infantry frontline cushion by +5% to absorb burst."
-            )
-        else:
-            st.info(
-                f"⚖️ **Neutral Elemental Matchup ({my_element} vs {enemy_element}):** "
-                "Standard lethality and Planar Penetration multipliers apply."
-            )
-
-        st.caption(
-            "**6-Element Planar Matrix:** `❄️ Ice > 🔥 Fire > 🌪️ Wind > 🪨 Earth > ❄️ Ice`  |  "
-            "`☀️ Light ↔ 🌑 Dark` (Mutual Planar Counter; transcendent to the 4 primal elements)"
-        )
-
-    def _render_realtor_mortgage_calculator(self) -> None:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            home_price = st.number_input("Home Purchase Price ($):", min_value=50000, max_value=25000000, value=450000, step=10000)
-            down_pct = st.slider("Down Payment (%):", min_value=0, max_value=60, value=20, step=1)
-            down_amount = home_price * (down_pct / 100.0)
-            st.caption(f"Down Payment: **${down_amount:,.0f}** | Loan Principal: **${home_price - down_amount:,.0f}**")
-        with col2:
-            interest_rate = st.number_input("Annual Interest Rate (%):", min_value=1.0, max_value=15.0, value=6.25, step=0.125)
-            loan_term_years = st.selectbox("Loan Term (Years):", [30, 20, 15, 10], index=0)
-        with col3:
-            prop_tax_rate = st.number_input("Annual Property Tax Rate (%):", min_value=0.0, max_value=5.0, value=1.15, step=0.05)
-            annual_ins = st.number_input("Annual Homeowner's Insurance ($):", min_value=0, max_value=25000, value=1500, step=100)
-            monthly_hoa = st.number_input("Monthly HOA / Condo Dues ($):", min_value=0, max_value=5000, value=0, step=25)
-
-        loan_amount = home_price - down_amount
-        n_months = loan_term_years * 12
-        monthly_r = (interest_rate / 100.0) / 12.0
-
-        if monthly_r > 0 and loan_amount > 0:
-            monthly_pi = loan_amount * (monthly_r * (1 + monthly_r) ** n_months) / ((1 + monthly_r) ** n_months - 1)
-        else:
-            monthly_pi = loan_amount / n_months if n_months else 0.0
-
-        monthly_tax = (home_price * (prop_tax_rate / 100.0)) / 12.0
-        monthly_ins = annual_ins / 12.0
-        monthly_pmi = ((loan_amount * 0.0055) / 12.0) if down_pct < 20 else 0.0
-        total_monthly = monthly_pi + monthly_tax + monthly_ins + monthly_pmi + monthly_hoa
-
-        st.subheader(f"💵 Estimated Monthly Payment: **${total_monthly:,.2f} / month**")
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Principal & Interest", f"${monthly_pi:,.2f}")
-        k2.metric("Property Taxes", f"${monthly_tax:,.2f}")
-        k3.metric("Home Insurance", f"${monthly_ins:,.2f}")
-        k4.metric("Estimated PMI", f"${monthly_pmi:,.2f}", "0% at 20%+ down" if down_pct >= 20 else "Required (<20% down)")
-        k5.metric("HOA Dues", f"${monthly_hoa:,.2f}")
-
-    # =========================================================================
-    # PAGE 4: LAUGHING MOON & THE CREATOR
-    # =========================================================================
     def page_lore_vault(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("vault_header", "Laughing Moon, Cosmic Trance & The Creator"))
@@ -598,7 +446,7 @@ class StreamlitUI:
         t_creator, t_humor, t_media = st.tabs([
             self.profile.get_str("creator_tab_title", "🌟 About the Creator (Aerith)"),
             self.profile.get_str("humor_tab_title", "🌙 Laughing Moon Wit"),
-            self.profile.get_str("media_tab_title", "🎵 Cosmic Trance & Media")
+            self.profile.get_str("media_tab_title", "🎵 Cosmic Trance & Media"),
         ])
 
         with t_creator:
@@ -623,9 +471,6 @@ class StreamlitUI:
                     else:
                         st.markdown(f"[🔗 Open Resource]({item['url']})")
 
-    # =========================================================================
-    # PAGE 5: SOVEREIGN KNOWLEDGE FORGE (WITH DOUBLE-CLICK DATA_EDITOR)
-    # =========================================================================
     def page_sovereign_forge(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("forge_header", "Sovereign Knowledge Forge & Auto-Scout"))
@@ -651,7 +496,7 @@ class StreamlitUI:
         tab_grid, tab_add, tab_jokes_media = st.tabs([
             "📊 Double-Click Strategy Grid Editor",
             "➕ Inscribe New Strategy Guide",
-            "🌙 Double-Click Laughing Moon & Media Editor"
+            "🌙 Double-Click Laughing Moon & Media Editor",
         ])
 
         with tab_grid:
@@ -664,9 +509,9 @@ class StreamlitUI:
                 width="stretch",
                 column_config={
                     "access_tier": st.column_config.SelectboxColumn("Access Tier", options=self.profile.access_tiers, required=True),
-                    "content": st.column_config.TextColumn("Strategy Content", width="large")
+                    "content": st.column_config.TextColumn("Strategy Content", width="large"),
                 },
-                key="strategy_docs_data_editor"
+                key="strategy_docs_data_editor",
             )
             if st.button("💾 Save Strategy Grid Changes & Sync to GitHub Vault", width="stretch"):
                 self.db.sync_strategy_dataframe(edited_df)
@@ -684,9 +529,12 @@ class StreamlitUI:
                 if st.form_submit_button("💾 Inscribe Guide & Sync to GitHub Vault", width="stretch"):
                     if f_kw and f_topic and f_content:
                         self.db.add_verified_strategy(
-                            f_kw, f_topic, f_content,
+                            f_kw,
+                            f_topic,
+                            f_content,
                             verified_by=self.profile.creator_name,
-                            category=f_cat, access_tier=f_tier
+                            category=f_cat,
+                            access_tier=f_tier,
                         )
                         st.success(f"Saved '{f_topic}' and queued GitHub Vault sync!")
                     else:
@@ -704,7 +552,7 @@ class StreamlitUI:
 
             st.divider()
             with st.form("add_media_form"):
-                st.subheader("Add Multimedia Stream / Direct MP3 Link")
+                st.subheader("Add Multimedia Stream / YouTube / Direct MP3 Link")
                 m_title = st.text_input("Media Title:")
                 m_cat = st.text_input("Category:", value="Music")
                 m_url = st.text_input("YouTube or Direct MP3/M4A URL:")
@@ -715,16 +563,12 @@ class StreamlitUI:
                         st.success("Media added!")
                         st.rerun()
 
-    # =========================================================================
-    # PAGE 6: MODE, STRING & PERSONA STUDIO (WITH PYTHON FILE FALLBACK)
-    # =========================================================================
     def page_mode_string_studio(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("studio_header", "Interactive Mode, String & Persona Studio"))
         st.caption(
-            f"Editing Mode: **`{self.profile.mode_key}`** (Backed by `mode_{self.profile.mode_key}.py` defaults). "
-            "All edits save into SQLite (`mode_overrides` table) and sync to GitHub `db-vault`. "
-            "You can revert to the pristine Python file defaults at any time with 1 click."
+            f"Editing Mode: **`{self.profile.mode_key}`** (Backed by `modes/{self.profile.mode_key}/profile.py` defaults). "
+            "All edits save into SQLite (`mode_overrides` table) and sync to GitHub `db-vault`."
         )
 
         current_overrides = self.db.get_mode_override(self.profile.mode_key)
@@ -733,7 +577,7 @@ class StreamlitUI:
             "✏️ Displayed Site Strings & Headers",
             "👑 Persona, Aerith Relationship & Trusted Sources",
             "⚙️ Feature Toggles & Backup Interval",
-            "🔄 Revert to Python File / Create Mode"
+            "🔄 Revert to Python File / Create Mode",
         ])
 
         with tab_strings:
@@ -755,7 +599,7 @@ class StreamlitUI:
                         updated_strings[s_key] = st.text_input(
                             f"`{s_key}`",
                             value=self.profile.ui_strings[s_key],
-                            key=f"str_edit_{s_key}"
+                            key=f"str_edit_{s_key}",
                         )
                 if st.form_submit_button("💾 Save All Displayed Strings to Database & GitHub Vault", width="stretch"):
                     current_overrides["header_title"] = new_h_title
@@ -769,31 +613,31 @@ class StreamlitUI:
                     st.rerun()
 
         with tab_persona:
-            st.subheader("How Aurora Sees Herself, Relates to Aerith & Verifies Sources")
+            st.subheader("Self-Identity, Creator Relationship & Trusted Sources")
             with st.form("persona_editor_form"):
                 new_self_id = st.text_area(
-                    "Self-Identity & Voice Description (How she sees herself & speaks):",
+                    "Self-Identity & Voice Description:",
                     value=self.profile.self_identity_description,
-                    height=130
+                    height=130,
                 )
                 new_creator_rel = st.text_area(
-                    "Creator (Aerith) Relationship Rules (Unprompted restraint vs. excitement when speaking to Aerith):",
+                    "Creator (Aerith) Relationship Rules:",
                     value=self.profile.creator_relationship_instruction,
-                    height=150
+                    height=150,
                 )
                 new_sys_inst = st.text_area(
                     "Core Tactical & Behavioral Directives:",
                     value=self.profile.system_instruction,
-                    height=130
+                    height=130,
                 )
                 new_about_md = st.text_area(
-                    "About the Creator (Aerith) Markdown (Displayed on Laughing Moon & Creator page):",
+                    "About the Creator Markdown:",
                     value=self.profile.about_creator_markdown,
-                    height=130
+                    height=130,
                 )
                 domains_str = st.text_input(
-                    "Trusted Verification Domains (comma-separated, requires only 1 hit to auto-verify):",
-                    value=", ".join(self.profile.trusted_domains)
+                    "Trusted Verification Domains (comma-separated):",
+                    value=", ".join(self.profile.trusted_domains),
                 )
 
                 if st.form_submit_button("💾 Save Persona, Creator Rules & Trusted Sources", width="stretch"):
@@ -823,8 +667,10 @@ class StreamlitUI:
                 en_ping = w1.checkbox("Enable Keep-Alive Self-Ping", value=self.profile.enable_keep_alive_ping)
                 b_hours = w2.number_input(
                     "Auto-Backup Interval (Hours):",
-                    min_value=0.5, max_value=24.0,
-                    value=float(self.profile.backup_interval_hours), step=0.5
+                    min_value=0.5,
+                    max_value=24.0,
+                    value=float(self.profile.backup_interval_hours),
+                    step=0.5,
                 )
                 pub_url = w3.text_input("Public App URL (for Keep-Alive Ping):", value=self.profile.app_public_url)
 
@@ -838,7 +684,7 @@ class StreamlitUI:
                         "enable_lore_vault": en_vault,
                         "enable_keep_alive_ping": en_ping,
                         "backup_interval_hours": float(b_hours),
-                        "app_public_url": pub_url.strip()
+                        "app_public_url": pub_url.strip(),
                     })
                     self.db.save_mode_override(self.profile.mode_key, current_overrides)
                     self.profile.apply_overrides(current_overrides)
@@ -852,7 +698,7 @@ class StreamlitUI:
                     st.subheader("🔄 Fallback to Python Mode File Defaults")
                     st.write(
                         f"Clears all custom database overrides for **`{self.profile.mode_key}`** and restores "
-                        f"100% of the original strings, prompts, and settings defined in `mode_{self.profile.mode_key}.py`."
+                        f"100% of the original strings, prompts, and settings defined in `modes/{self.profile.mode_key}/profile.py`."
                     )
                     if st.button("🔄 Revert Mode to Python File Defaults Now", width="stretch"):
                         self.db.delete_mode_override(self.profile.mode_key)
@@ -870,18 +716,16 @@ class StreamlitUI:
                         if st.form_submit_button("➕ Create New Mode Profile", width="stretch"):
                             clean_slug = new_mode_slug.lower().strip().replace(" ", "_")
                             if clean_slug:
+                                DomainConfig.register_custom_mode(clean_slug, db=self.db)
                                 self.db.save_mode_override(clean_slug, {
                                     "page_title": new_mode_title or f"{clean_slug.title()} AI",
                                     "header_title": new_mode_title or f"✨ {clean_slug.title()} AI",
                                     "bot_name": new_mode_bot or "Aurora",
-                                    "enable_discord": False
+                                    "enable_discord": False,
                                 })
-                                st.success(f"Created mode `{clean_slug}`! Switch to it in the sidebar.")
+                                st.success(f"Created mode `{clean_slug}` with isolated DB `{clean_slug}_core.db`! Switch to it in the sidebar.")
                                 st.rerun()
 
-    # =========================================================================
-    # PAGE 7: CELESTIAL MEMORY INSPECTOR (WITH DOUBLE-CLICK PROFILE EDITOR)
-    # =========================================================================
     def page_memory_inspector(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("memory_header", "Celestial Memory & User Profile Inspector"))
@@ -897,7 +741,7 @@ class StreamlitUI:
             "👤 L1 User Profiles (Double-Click Editable)",
             "📝 Rolling Summaries",
             "📌 L2 Episodic Memory",
-            "💬 Recent Chat Logs"
+            "💬 Recent Chat Logs",
         ])
         with t1:
             st.caption("Double-click any cell to edit permanent user profile facts.")
@@ -913,9 +757,6 @@ class StreamlitUI:
         with t4:
             st.dataframe(chats_df, width="stretch")
 
-    # =========================================================================
-    # PAGE 8: SILENCE VEIL & ABUSE LEDGER
-    # =========================================================================
     def page_silence_controller(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("silence_header", "Channel Silence Veil & Hostility Ledger"))
@@ -944,15 +785,69 @@ class StreamlitUI:
                 st.success(f"Pardoned user {u_to_pardon}.")
                 st.rerun()
 
-    # =========================================================================
-    # PAGE 9: DISCORD VOICE & RESONANCE BROADCASTER
-    # =========================================================================
     def page_discord_broadcaster(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("broadcast_header", "Discord Voice & Resonance Broadcaster"))
 
-        default_ch = self.discord_worker.allowed_channel_ids[0] if self.discord_worker.allowed_channel_ids else ""
-        target_ch = st.text_input("Target Discord Channel ID:", value=default_ch)
+        available_channels = self.discord_worker.get_available_channels()
+        dropdown_options = [ch["label"] for ch in available_channels] + ["Custom Channel ID..."]
+
+        col_sel, col_ref = st.columns([4, 1])
+        with col_sel:
+            selected_option = st.selectbox(
+                "Select Target Discord Channel:",
+                options=dropdown_options,
+                key="discord_broadcaster_channel_select",
+            )
+        with col_ref:
+            st.write("")
+            st.write("")
+            if st.button("🔄 Refresh", width="stretch", key="refresh_discord_channels_btn"):
+                self.discord_worker._refresh_channels_cache_from_guilds()
+                st.rerun()
+
+        if selected_option == "Custom Channel ID...":
+            col_name, col_id = st.columns(2)
+            with col_id:
+                target_ch = st.text_input(
+                    "Enter Custom Discord Channel ID:",
+                    placeholder="123456789012345678",
+                    key="discord_broadcaster_custom_id",
+                ).strip()
+            resolved = self.discord_worker.resolve_channel_info(target_ch) if target_ch else {"guild": "", "name": ""}
+            display_name = (
+                f"{resolved['guild']} / {resolved['name']}"
+                if resolved.get("name")
+                else "Enter a Channel ID to look up name"
+            )
+            with col_name:
+                st.text_input(
+                    "Channel Name:",
+                    value=display_name,
+                    disabled=True,
+                    key="discord_broadcaster_custom_name_display",
+                )
+        else:
+            matched = next((ch for ch in available_channels if ch["label"] == selected_option), None)
+            target_ch = matched["id"] if matched else ""
+            channel_display_name = (
+                f"{matched['guild']} / {matched['name']}" if matched else "Unknown Channel"
+            )
+            col_name, col_id = st.columns(2)
+            with col_name:
+                st.text_input(
+                    "Channel Name:",
+                    value=channel_display_name,
+                    disabled=True,
+                    key="discord_broadcaster_resolved_name",
+                )
+            with col_id:
+                st.text_input(
+                    "Channel ID:",
+                    value=target_ch,
+                    disabled=True,
+                    key="discord_broadcaster_resolved_id",
+                )
 
         if "broadcast_draft_text" not in st.session_state:
             st.session_state.broadcast_draft_text = ""
@@ -960,7 +855,7 @@ class StreamlitUI:
         raw_input = st.text_area(
             "Announcement Message (Write plain notes or final text):",
             value=st.session_state.broadcast_draft_text,
-            height=150
+            height=150,
         )
 
         c_draft, c_send = st.columns(2)
@@ -980,21 +875,17 @@ class StreamlitUI:
                 else:
                     st.error(status)
             else:
-                st.warning("Provide both a Channel ID and a message.")
+                st.warning("Select a valid channel and enter a message.")
 
-    # =========================================================================
-    # PAGE 10: DATABASE VAULT, GITHUB SYNC & PROJECT ZIP EXPORTER
-    # =========================================================================
     def page_database_vault(self) -> None:
         self.render_banner()
         st.header(self.profile.get_str("db_header", "Database Vault, Auto-Backup & Watchdog Controls"))
         st.caption(
-            f"Active Database File: `{self.db.db_file}` • "
+            f"Active Mode: `{self.profile.mode_key}` • Isolated Database File: `{self.db.db_file}` • "
             f"Scheduled Auto-Backup Every **{self.profile.backup_interval_hours}h** • "
             f"Keep-Alive Self-Ping: **{'Active' if self.profile.enable_keep_alive_ping else 'Paused'}**"
         )
 
-        # 1. GitHub Branch Vault Cloud Persistence Panel
         with st.container(border=True):
             st.subheader("☁️ GitHub `db-vault` Branch Auto-Persistence")
             if self.db.vault.is_configured:
@@ -1009,7 +900,7 @@ class StreamlitUI:
                         ok, msg = self.db.vault.push_bytes_to_vault(
                             f"backups/{self.db.db_file}",
                             raw,
-                            f"Manual Admin Backup ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})"
+                            f"Manual Admin Backup ({datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})",
                         )
                         if ok:
                             st.success(msg)
@@ -1038,12 +929,11 @@ class StreamlitUI:
                     "Streamlit Secrets to enable automatic zero-reboot cloud persistence!"
                 )
 
-        # 2. Manual Local SQLite Download & Live Restore
         col_dl, col_ul = st.columns(2)
         with col_dl:
             with st.container(border=True):
                 st.subheader("📥 Download Live SQLite Backup")
-                st.write("Creates a lock-free binary snapshot of your active SQLite database.")
+                st.write(f"Creates a lock-free binary snapshot of `{self.db.db_file}`.")
                 db_bytes = self.db.export_db_bytes()
                 st.download_button(
                     label=f"💾 Download {self.db.db_file} ({len(db_bytes):,} bytes)",
@@ -1051,7 +941,7 @@ class StreamlitUI:
                     file_name=f"backup_{self.db.db_file}",
                     mime="application/octet-stream",
                     key="stable_sqlite_download_btn",
-                    width="stretch"
+                    width="stretch",
                 )
 
         with col_ul:
@@ -1066,10 +956,9 @@ class StreamlitUI:
                         else:
                             st.error(msg)
 
-        # 3. 1-Click Full Modular Project .zip Exporter
         with st.container(border=True):
             st.subheader("📦 Export Complete Modular Project (.zip)")
-            st.caption("Download all refactored `.py` modules (including `mode_gaming.py` and `mode_realtor.py`), `requirements.txt`, and config files in a single `.zip` bundle.")
+            st.caption("Download all refactored `.py` modules (including `capabilities/` and `modes/` packages), `requirements.txt`, and config files in a single `.zip` bundle.")
             zip_bytes = self._build_project_zip_bytes()
             st.download_button(
                 label="📦 Download Aurora-KoA-Modular.zip",
@@ -1077,16 +966,34 @@ class StreamlitUI:
                 file_name="Aurora-KoA-Modular.zip",
                 mime="application/zip",
                 key="download_full_project_zip_btn",
-                width="stretch"
+                width="stretch",
             )
 
     def _build_project_zip_bytes(self) -> bytes:
-        """Packages all project files into an in-memory .zip archive."""
         buf = io.BytesIO()
         project_files = [
-            "bot.py", "profiles.py", "mode_gaming.py", "mode_realtor.py",
-            "database.py", "ai_engine.py", "discord_worker.py", "web_ui.py",
-            "requirements.txt", "secrets_template.toml", ".streamlit/config.toml", "README.md"
+            "bot.py",
+            "profiles.py",
+            "database.py",
+            "ai_engine.py",
+            "discord_worker.py",
+            "web_ui.py",
+            "build_zip.py",
+            "requirements.txt",
+            "secrets_template.toml",
+            ".streamlit/config.toml",
+            ".devcontainer/devcontainer.json",
+            "README.md",
+            "capabilities/__init__.py",
+            "capabilities/music_conduit.py",
+            "capabilities/web_research.py",
+            "modes/__init__.py",
+            "modes/gaming/__init__.py",
+            "modes/gaming/profile.py",
+            "modes/gaming/march_calculator.py",
+            "modes/realtor/__init__.py",
+            "modes/realtor/profile.py",
+            "modes/realtor/payment_calculator.py",
         ]
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for rel_path in project_files:
@@ -1095,9 +1002,6 @@ class StreamlitUI:
         buf.seek(0)
         return buf.read()
 
-    # =========================================================================
-    # MAIN NAVIGATION ROUTER
-    # =========================================================================
     def run(self) -> None:
         self.render_sidebar_auth()
 

@@ -1,10 +1,11 @@
 """
 database.py
-Encapsulates all SQLite database operations, L1/L2 memory retrieval,
-database-backed Mode & UI String Overrides (with instant fallback to Python file defaults),
+Encapsulates isolated per-mode SQLite databases (aurora_core.db for gaming,
+realtor_core.db for realtor, <mode>_core.db for custom modes), L1/L2 memory retrieval,
+database-backed Mode & UI String Overrides (with instant fallback to Python defaults),
 bulk DataFrame editors for double-click st.data_editor tables,
 live thread-safe SQLite .backup() export/restore, and automatic persistence
-to a dedicated 'db-vault' branch on GitHub so Streamlit Cloud reboots never wipe data.
+to a dedicated 'db-vault' branch on GitHub (including site_state & custom_modes).
 """
 
 import os
@@ -20,15 +21,19 @@ from typing import List, Dict, Optional, Tuple, Any
 import pandas as pd
 import requests
 
-from profiles import BotProfile, get_secret_or_env
+from profiles import (
+    BotProfile,
+    SITE_STATE_FILE,
+    CUSTOM_MODES_FILE,
+    get_secret_or_env,
+    get_deployment_namespace,
+)
 
 
 class GitHubVaultSync:
     """
-    Synchronizes the active SQLite .db file to a dedicated branch (default: 'db-vault')
-    in the user's GitHub repository via the GitHub REST API.
-    Because it commits to 'db-vault' instead of 'main', Streamlit Cloud NEVER triggers
-    an unwanted reboot when saving the database.
+    Synchronizes each mode's isolated SQLite .db file and global site state files
+    to a dedicated branch (default: 'db-vault') in GitHub via REST API.
     """
 
     def __init__(self, db_filename: str):
@@ -41,7 +46,6 @@ class GitHubVaultSync:
         self._lock = threading.Lock()
 
     def _detect_repo_from_git(self) -> str:
-        """Auto-detects 'owner/repo' from .git/config if GITHUB_REPO isn't explicitly set in Secrets."""
         git_config = os.path.join(".git", "config")
         if os.path.exists(git_config):
             try:
@@ -62,11 +66,10 @@ class GitHubVaultSync:
         return {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"
+            "X-GitHub-Api-Version": "2022-11-28",
         }
 
     def ensure_vault_branch_exists(self) -> bool:
-        """Verifies the 'db-vault' branch exists on GitHub, creating it off the default branch if needed."""
         if not self.is_configured:
             return False
         try:
@@ -81,7 +84,7 @@ class GitHubVaultSync:
             ref_resp = requests.get(
                 f"https://api.github.com/repos/{self.repo}/git/ref/heads/{default_branch}",
                 headers=self._headers(),
-                timeout=10
+                timeout=10,
             )
             if ref_resp.status_code != 200:
                 return False
@@ -91,7 +94,7 @@ class GitHubVaultSync:
                 f"https://api.github.com/repos/{self.repo}/git/refs",
                 headers=self._headers(),
                 json={"ref": f"refs/heads/{self.branch}", "sha": base_sha},
-                timeout=10
+                timeout=10,
             )
             return create_resp.status_code in (200, 201)
         except Exception as e:
@@ -99,7 +102,6 @@ class GitHubVaultSync:
             return False
 
     def pull_file_from_vault(self, remote_path: str, local_path: str) -> Tuple[bool, str]:
-        """Downloads a file from the GitHub 'db-vault' branch and writes it safely to disk."""
         if not self.is_configured:
             return False, "GITHUB_TOKEN not set in Streamlit Secrets."
 
@@ -131,7 +133,6 @@ class GitHubVaultSync:
             return False, f"GitHub pull failed: {e}"
 
     def push_bytes_to_vault(self, remote_path: str, raw_bytes: bytes, commit_msg: str) -> Tuple[bool, str]:
-        """Uploads raw file bytes to the GitHub 'db-vault' branch."""
         if not self.is_configured:
             return False, "GITHUB_TOKEN not set in Streamlit Secrets."
 
@@ -145,7 +146,7 @@ class GitHubVaultSync:
                 payload: Dict[str, Any] = {
                     "message": commit_msg,
                     "content": base64.b64encode(raw_bytes).decode("ascii"),
-                    "branch": self.branch
+                    "branch": self.branch,
                 }
                 if existing_sha:
                     payload["sha"] = existing_sha
@@ -164,9 +165,9 @@ class GitHubVaultSync:
 
 class DatabaseManager:
     """
-    Thread-safe SQLite Manager handling all schema migrations, L1/L2 memory,
-    rolling summaries, tiered knowledge base lookups, mode/UI string overrides,
-    silence/abuse tracking, live .backup() snapshots, and automatic GitHub 'db-vault' persistence.
+    Thread-safe Mode-Isolated SQLite Manager.
+    Each mode operates on its own isolated .db file (e.g., aurora_core.db vs realtor_core.db),
+    while sharing site-wide mode state via site_state.json + GitHub db-vault.
     """
 
     def __init__(self, profile: BotProfile):
@@ -184,22 +185,32 @@ class DatabaseManager:
         return conn
 
     def _startup_restore_check(self) -> None:
-        """
-        On container boot, if the local SQLite database does not exist yet (ephemeral wipe),
-        automatically restores it from the GitHub 'db-vault' branch.
-        """
         if not self.vault.is_configured:
             return
 
         if not os.path.exists(self.db_file) or os.path.getsize(self.db_file) == 0:
             ok, msg = self.vault.pull_file_from_vault(f"backups/{self.db_file}", self.db_file)
-            print(f"[GitHub Vault Startup Check] {msg}")
+            print(f"[GitHub Vault Startup Check - {self.db_file}] {msg}")
+
+        if not os.path.exists(CUSTOM_MODES_FILE):
+            self.vault.pull_file_from_vault(f"backups/{CUSTOM_MODES_FILE}", CUSTOM_MODES_FILE)
+
+    def sync_json_file_to_vault(self, local_path: str, remote_path: str, commit_msg: str) -> None:
+        """Asynchronously pushes a small JSON state file (like site_state.json) to GitHub db-vault."""
+        if not self.vault.is_configured or not os.path.exists(local_path):
+            return
+
+        def _push():
+            try:
+                with open(local_path, "rb") as f:
+                    raw = f.read()
+                self.vault.push_bytes_to_vault(remote_path, raw, commit_msg)
+            except Exception as e:
+                print(f"[JSON Vault Sync Notice]: {e}")
+
+        threading.Thread(target=_push, daemon=True).start()
 
     def trigger_background_sync(self, force: bool = False, reason: str = "Auto-sync") -> None:
-        """
-        Spawns a non-blocking daemon thread to push the database snapshot to GitHub 'db-vault'.
-        Enforces a 60-second cooldown on automatic chat syncs unless force=True (admin edits).
-        """
         if not self.vault.is_configured:
             return
         if not force and (time.time() - self.vault.last_sync_time) < 60:
@@ -212,18 +223,16 @@ class DatabaseManager:
                 self.vault.push_bytes_to_vault(
                     f"backups/{self.db_file}",
                     raw_bytes,
-                    f"[{self.profile.mode_key}] {reason} ({ts})"
+                    f"[{self.profile.mode_key}] {reason} ({ts})",
                 )
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def init_db(self) -> None:
-        """Initializes all tables, runs seamless column migrations, and seeds initial profile data."""
         with self.write_lock:
             conn = self._get_conn()
             c = conn.cursor()
 
-            # 1. Cross-channel chat logs
             c.execute("""
                 CREATE TABLE IF NOT EXISTS user_chat (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -235,7 +244,6 @@ class DatabaseManager:
                 )
             """)
 
-            # 2. Rolling summaries
             c.execute("""
                 CREATE TABLE IF NOT EXISTS user_summaries (
                     user_id TEXT PRIMARY KEY,
@@ -244,7 +252,6 @@ class DatabaseManager:
                 )
             """)
 
-            # 3. L1 Long-Term Profile Memory
             c.execute("""
                 CREATE TABLE IF NOT EXISTS user_profiles (
                     user_id TEXT PRIMARY KEY,
@@ -253,7 +260,6 @@ class DatabaseManager:
                 )
             """)
 
-            # 4. L2 Episodic Memory
             c.execute("""
                 CREATE TABLE IF NOT EXISTS episodic_memory (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,7 +270,6 @@ class DatabaseManager:
                 )
             """)
 
-            # 5. Tiered Strategy & Knowledge Base
             c.execute("""
                 CREATE TABLE IF NOT EXISTS strategy_docs (
                     keyword TEXT PRIMARY KEY,
@@ -284,7 +289,6 @@ class DatabaseManager:
             if "access_tier" not in existing_cols:
                 c.execute("ALTER TABLE strategy_docs ADD COLUMN access_tier TEXT DEFAULT 'Everyone'")
 
-            # 6. Joke / Laughing Moon Vault
             c.execute("""
                 CREATE TABLE IF NOT EXISTS jokes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -293,7 +297,6 @@ class DatabaseManager:
                 )
             """)
 
-            # 7. Multimedia & Lore Vault
             c.execute("""
                 CREATE TABLE IF NOT EXISTS media_vault (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -306,7 +309,6 @@ class DatabaseManager:
                 )
             """)
 
-            # 8. Silence Protocol Tracker
             c.execute("""
                 CREATE TABLE IF NOT EXISTS silence_status (
                     channel_id TEXT PRIMARY KEY,
@@ -315,7 +317,6 @@ class DatabaseManager:
                 )
             """)
 
-            # 9. Abuse & Hostility Tally Ledger
             c.execute("""
                 CREATE TABLE IF NOT EXISTS abuse_ledger (
                     user_id TEXT PRIMARY KEY,
@@ -326,7 +327,6 @@ class DatabaseManager:
                 )
             """)
 
-            # 10. Database-Backed Mode & UI String Overrides (Fallback-Safe Layering)
             c.execute("""
                 CREATE TABLE IF NOT EXISTS mode_overrides (
                     mode_key TEXT PRIMARY KEY,
@@ -335,7 +335,6 @@ class DatabaseManager:
                 )
             """)
 
-            # Seed strategy_docs using INSERT OR IGNORE so existing edits are preserved while missing seeds are added
             for kw, topic, cat, tier, content, ver in self.profile.seed_docs:
                 c.execute(
                     """
@@ -343,27 +342,24 @@ class DatabaseManager:
                     (keyword, topic, category, access_tier, content, verified_by)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (kw.lower().strip(), topic, cat, tier, content, ver)
+                    (kw.lower().strip(), topic, cat, tier, content, ver),
                 )
 
-            # Seed jokes/tips
             for jk in self.profile.seed_jokes:
                 c.execute("INSERT OR IGNORE INTO jokes (joke, added_by) VALUES (?, ?)", (jk, self.profile.bot_name))
 
-            # Seed media vault
             for title, cat, url, desc in self.profile.seed_media:
                 c.execute(
                     "INSERT OR IGNORE INTO media_vault (title, category, url, description, added_by) VALUES (?, ?, ?, ?, ?)",
-                    (title, cat, url, desc, self.profile.creator_name)
+                    (title, cat, url, desc, self.profile.creator_name),
                 )
 
             conn.commit()
             conn.close()
 
-    # --- MODE & UI STRING OVERRIDES (STORED IN SQLITE WITH PYTHON FILE FALLBACK) ---
+    # --- MODE & UI STRING OVERRIDES ---
 
     def get_mode_override(self, mode_key: str) -> Dict[str, Any]:
-        """Fetches stored JSON overrides for a mode_key from SQLite."""
         try:
             conn = self._get_conn()
             c = conn.cursor()
@@ -377,7 +373,6 @@ class DatabaseManager:
         return {}
 
     def save_mode_override(self, mode_key: str, overrides_dict: Dict[str, Any]) -> None:
-        """Saves customized mode strings, persona rules, and feature flags into SQLite and syncs to GitHub."""
         payload_json = json.dumps(overrides_dict, ensure_ascii=False, indent=2)
         with self.write_lock:
             conn = self._get_conn()
@@ -386,14 +381,13 @@ class DatabaseManager:
                 INSERT OR REPLACE INTO mode_overrides (mode_key, overrides_json, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
                 """,
-                (mode_key.lower().strip(), payload_json)
+                (mode_key.lower().strip(), payload_json),
             )
             conn.commit()
             conn.close()
         self.trigger_background_sync(force=True, reason=f"Updated mode_overrides for {mode_key}")
 
     def delete_mode_override(self, mode_key: str) -> None:
-        """Clears database overrides for mode_key, reverting it 100% to its Python mode file defaults."""
         with self.write_lock:
             conn = self._get_conn()
             conn.execute("DELETE FROM mode_overrides WHERE mode_key = ?", (mode_key.lower().strip(),))
@@ -415,10 +409,6 @@ class DatabaseManager:
     # --- LIVE SAFE BACKUP & RESTORE (.backup() API) ---
 
     def export_db_bytes(self) -> bytes:
-        """
-        Uses SQLite's online .backup() API to create a consistent binary snapshot of the database
-        even while the Discord background worker has active connections open.
-        """
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db")
         os.close(tmp_fd)
         try:
@@ -441,10 +431,6 @@ class DatabaseManager:
                     pass
 
     def restore_from_bytes(self, raw_bytes: bytes) -> Tuple[bool, str]:
-        """
-        Validates an uploaded SQLite .db file and hot-swaps it into the active database
-        using SQLite's online .backup() API so active threads never hit corrupt file locks.
-        """
         if not raw_bytes or len(raw_bytes) < 100 or not raw_bytes.startswith(b"SQLite format 3"):
             return False, "Invalid file: Uploaded file is not a valid SQLite 3 database."
 
@@ -464,7 +450,7 @@ class DatabaseManager:
 
             self.init_db()
             self.trigger_background_sync(force=True, reason="Manual DB Restore")
-            return True, f"Successfully restored database ({len(raw_bytes):,} bytes) and queued cloud sync!"
+            return True, f"Successfully restored {self.db_file} ({len(raw_bytes):,} bytes) and queued cloud sync!"
         except Exception as e:
             return False, f"Restore failed: {e}"
         finally:
@@ -481,7 +467,7 @@ class DatabaseManager:
             conn = self._get_conn()
             conn.execute(
                 "INSERT INTO user_chat (user_id, channel_id, role, content) VALUES (?, ?, ?, ?)",
-                (str(user_id), str(channel_id), role, content)
+                (str(user_id), str(channel_id), role, content),
             )
             conn.commit()
             conn.close()
@@ -492,7 +478,7 @@ class DatabaseManager:
             conn = self._get_conn()
             conn.execute(
                 "INSERT OR REPLACE INTO user_profiles (user_id, facts, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                (str(user_id), facts.strip())
+                (str(user_id), facts.strip()),
             )
             conn.commit()
             conn.close()
@@ -503,7 +489,7 @@ class DatabaseManager:
             conn = self._get_conn()
             conn.execute(
                 "INSERT INTO episodic_memory (user_id, topic, content) VALUES (?, ?, ?)",
-                (str(user_id), topic.strip(), content.strip())
+                (str(user_id), topic.strip(), content.strip()),
             )
             conn.commit()
             conn.close()
@@ -514,14 +500,13 @@ class DatabaseManager:
             conn = self._get_conn()
             conn.execute(
                 "INSERT OR REPLACE INTO user_summaries (user_id, summary, last_updated) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                (str(user_id), summary.strip())
+                (str(user_id), summary.strip()),
             )
             conn.commit()
             conn.close()
         self.trigger_background_sync(force=False, reason="Summary update")
 
     def get_ltm_context(self, user_id: str, prompt: str) -> str:
-        """Retrieves L1 Profile facts, selective L2 Episodic notes, and rolling summary ($0 tokens)."""
         conn = self._get_conn()
         c = conn.cursor()
 
@@ -562,12 +547,8 @@ class DatabaseManager:
         timeout_minutes: int = 120,
         max_turns: int = 14,
         char_limit: int = 1800,
-        since_timestamp: Optional[str] = None
+        since_timestamp: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Fetches expanded multi-turn user history within the active window (default 14 turns / 2 hours)
-        and prepends L1/L2 + rolling summary as a valid user/model context pair.
-        """
         conn = self._get_conn()
         c = conn.cursor()
 
@@ -579,7 +560,7 @@ class DatabaseManager:
                   AND timestamp >= ?
                 ORDER BY id DESC LIMIT ?
                 """,
-                (str(user_id), since_timestamp, max_turns)
+                (str(user_id), since_timestamp, max_turns),
             )
         else:
             c.execute(
@@ -589,7 +570,7 @@ class DatabaseManager:
                   AND timestamp >= datetime('now', '-' || ? || ' minutes')
                 ORDER BY id DESC LIMIT ?
                 """,
-                (str(user_id), timeout_minutes, max_turns)
+                (str(user_id), timeout_minutes, max_turns),
             )
         rows = c.fetchall()
         conn.close()
@@ -631,7 +612,7 @@ class DatabaseManager:
         lines = [
             f"- Profile Facts: {profile}",
             f"- Rolling Summary: {summary}",
-            "- Recorded Episodes:"
+            "- Recorded Episodes:",
         ]
         for top, con, ts in episodes:
             lines.append(f"  [{ts}] {top}: {con}")
@@ -643,7 +624,6 @@ class DatabaseManager:
     # --- KNOWLEDGE BASE, STRATEGY DOCS & DATA_EDITOR BULK SYNC ---
 
     def query_local_docs(self, prompt: str, allowed_tiers: Optional[List[str]] = None) -> Optional[str]:
-        """Searches local strategy_docs first ($0 tokens, 0 API quota) filtered by access tier."""
         clean = prompt.lower()
         conn = self._get_conn()
         c = conn.cursor()
@@ -657,7 +637,15 @@ class DatabaseManager:
         conn.close()
         return "\n".join(matches[:4]) if matches else None
 
-    def add_verified_strategy(self, keyword: str, topic: str, content: str, verified_by: str, category: str = "General", access_tier: str = "Everyone") -> None:
+    def add_verified_strategy(
+        self,
+        keyword: str,
+        topic: str,
+        content: str,
+        verified_by: str,
+        category: str = "General",
+        access_tier: str = "Everyone",
+    ) -> None:
         with self.write_lock:
             conn = self._get_conn()
             conn.execute(
@@ -666,7 +654,7 @@ class DatabaseManager:
                 (keyword, topic, category, access_tier, content, verified_by, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
-                (keyword.lower().strip(), topic.strip(), category.strip(), access_tier.strip(), content.strip(), verified_by.strip())
+                (keyword.lower().strip(), topic.strip(), category.strip(), access_tier.strip(), content.strip(), verified_by.strip()),
             )
             conn.commit()
             conn.close()
@@ -695,13 +683,12 @@ class DatabaseManager:
                 "access_tier": tier or "Everyone",
                 "content": content,
                 "verified_by": ver,
-                "timestamp": ts
+                "timestamp": ts,
             })
         conn.close()
         return docs
 
     def sync_strategy_dataframe(self, edited_df: pd.DataFrame) -> None:
-        """Saves double-click st.data_editor changes (edits, additions, deletions) back to strategy_docs."""
         with self.write_lock:
             conn = self._get_conn()
             c = conn.cursor()
@@ -721,14 +708,13 @@ class DatabaseManager:
                     (keyword, topic, category, access_tier, content, verified_by, timestamp)
                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
-                    (kw, topic, cat, tier, content, ver)
+                    (kw, topic, cat, tier, content, ver),
                 )
             conn.commit()
             conn.close()
         self.trigger_background_sync(force=True, reason="Bulk edited strategy_docs table")
 
     def sync_profiles_dataframe(self, edited_df: pd.DataFrame) -> None:
-        """Saves double-click st.data_editor changes to L1 user_profiles."""
         with self.write_lock:
             conn = self._get_conn()
             c = conn.cursor()
@@ -739,7 +725,7 @@ class DatabaseManager:
                 if uid and facts:
                     c.execute(
                         "INSERT OR REPLACE INTO user_profiles (user_id, facts, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-                        (uid, facts)
+                        (uid, facts),
                     )
             conn.commit()
             conn.close()
@@ -774,7 +760,6 @@ class DatabaseManager:
         return rows
 
     def sync_jokes_dataframe(self, edited_df: pd.DataFrame) -> None:
-        """Saves double-click st.data_editor edits to the jokes table."""
         with self.write_lock:
             conn = self._get_conn()
             c = conn.cursor()
@@ -804,7 +789,7 @@ class DatabaseManager:
             conn = self._get_conn()
             conn.execute(
                 "INSERT OR REPLACE INTO media_vault (title, category, url, description, added_by) VALUES (?, ?, ?, ?, ?)",
-                (title.strip(), category.strip(), url.strip(), description.strip(), added_by)
+                (title.strip(), category.strip(), url.strip(), description.strip(), added_by),
             )
             conn.commit()
             conn.close()
@@ -817,7 +802,7 @@ class DatabaseManager:
             conn.commit()
             conn.close()
 
-    # --- SILENCE PROTOCOL & ABUSE TALLY (TIMEZONE-AWARE UTC) ---
+    # --- SILENCE PROTOCOL & ABUSE TALLY ---
 
     def set_silence(self, channel_id: str, hours_min: int = 1, hours_max: int = 4) -> None:
         now = datetime.now(timezone.utc)
@@ -827,7 +812,7 @@ class DatabaseManager:
             conn = self._get_conn()
             conn.execute(
                 "INSERT OR REPLACE INTO silence_status (channel_id, silence_until, max_silence_until) VALUES (?, ?, ?)",
-                (str(channel_id), min_s, max_s)
+                (str(channel_id), min_s, max_s),
             )
             conn.commit()
             conn.close()
@@ -861,7 +846,6 @@ class DatabaseManager:
             return "silenced", silence_until
 
     def record_abuse_offense(self, user_id: str, username: str) -> Tuple[int, Optional[str]]:
-        """Increments user hostility count and applies progressive cooldown mute if threshold exceeded."""
         now = datetime.now(timezone.utc)
         with self.write_lock:
             conn = self._get_conn()
@@ -880,7 +864,7 @@ class DatabaseManager:
                 INSERT OR REPLACE INTO abuse_ledger (user_id, username, offense_count, muted_until, last_offense)
                 VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
-                (str(user_id), username, count, muted_until_str)
+                (str(user_id), username, count, muted_until_str),
             )
             conn.commit()
             conn.close()
@@ -898,7 +882,7 @@ class DatabaseManager:
         c = conn.cursor()
         c.execute(
             "SELECT id FROM user_chat WHERE channel_id = ? AND timestamp >= datetime('now', '-' || ? || ' minutes') LIMIT 1",
-            (str(channel_id), minutes)
+            (str(channel_id), minutes),
         )
         engaged = c.fetchone() is not None
         conn.close()
