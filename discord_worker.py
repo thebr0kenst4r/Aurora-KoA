@@ -2,13 +2,15 @@
 discord_worker.py
 Encapsulates the optional Discord bot instance, event listeners (on_ready, on_message,
 on_raw_reaction_add), Zero-Token Reaction Pin Learning (📌 / 🌟 / ⭐), !learn command,
-Silence Protocol, hostility defense overrides, and cross-thread message broadcaster.
+Silence Protocol, hostility defense overrides, hybrid song MP3 delivery,
+and cross-thread message broadcaster.
 """
 
+import io
 import random
 import asyncio
 import threading
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 import discord
 from discord.ext import commands
 
@@ -18,7 +20,10 @@ from ai_engine import (
     GeminiEngine,
     SEARCH_TRIGGERS,
     REMEMBER_TRIGGERS,
-    SILENCE_TRIGGERS
+    SILENCE_TRIGGERS,
+    is_song_request,
+    search_songs_hybrid,
+    convert_m4a_url_to_mp3_bytes
 )
 
 LEARN_REACTION_EMOJIS = {"📌", "🌟", "⭐"}
@@ -214,7 +219,8 @@ class DiscordWorker:
                     await message.channel.send(self.db.get_random_joke())
                 return
 
-            clean_prompt = message.clean_content.replace(f"@{self.bot.user.name}", "").strip()
+            raw_user_text = message.clean_content.replace(f"@{self.bot.user.name}", "").strip()
+            clean_prompt = raw_user_text
             if is_defense:
                 clean_prompt = (
                     f"Someone just said this hostile remark about {self.profile.creator_name}: '{content}'. "
@@ -241,18 +247,49 @@ class DiscordWorker:
                     clean_prompt = f"{research_text}\n\n{clean_prompt}"
                     self.engine.process_knowledge_ingestion(clean_prompt, research_text, domains, is_sovereign_user=is_sov)
 
+            # 10b. Hybrid Song Lookup & MP3 Transcoding for Discord
+            discord_mp3_file: Optional[discord.File] = None
+            matched_tracks: List[Dict[str, str]] = []
+            if is_song_request(raw_user_text):
+                try:
+                    matched_tracks = await asyncio.to_thread(search_songs_hybrid, raw_user_text, 2)
+                    if matched_tracks:
+                        top_track = matched_tracks[0]
+                        mp3_bytes = await asyncio.to_thread(convert_m4a_url_to_mp3_bytes, top_track["m4a_url"])
+                        discord_mp3_file = discord.File(
+                            io.BytesIO(mp3_bytes),
+                            filename=top_track["mp3_filename"]
+                        )
+                        clean_prompt = (
+                            f"[Audio Track Located & Attached as Playable MP3 File '{top_track['mp3_filename']}': "
+                            f"{top_track['title']} by {top_track['artist']} | Direct M4A: {top_track['m4a_url']}]\n"
+                            f"{clean_prompt}"
+                        )
+                except Exception as audio_err:
+                    print(f"Discord audio conversion notice: {audio_err}")
+
             # 11. Creator Recognition vs. Unprompted Name Restraint
             if is_sov:
                 clean_prompt = (
-                    f"[Speaking directly to your beloved Creator and Sovereign, {self.profile.creator_name}! "
-                    f"Greet or answer her with warm, genuine excitement, pride, and devotion while keeping your counsel sharp]:\n"
+                    f"[Speaking directly to your beloved Creator and Sovereign, {self.profile.creator_name}. "
+                    f"Keep your counsel sharp, warm, and natural without repeating her name unnecessarily]:\n"
                     f"{clean_prompt}"
                 )
 
-            # 12. Assemble Context & Generate
-            user_history = self.db.get_active_user_context(user_id, clean_prompt, timeout_minutes=25, max_turns=2, char_limit=350)
-            contents = user_history + [{"role": "user", "parts": [{"text": clean_prompt}]}]
-            self.db.save_chat(user_id, channel_id, "user", clean_prompt)
+            # 12. Assemble Expanded Multi-Turn Context & Generate
+            user_history = self.db.get_active_user_context(
+                user_id,
+                raw_user_text,
+                timeout_minutes=120,
+                max_turns=14,
+                char_limit=1800
+            )
+            contents = self.engine.build_conversation_contents(
+                history_messages=user_history,
+                current_prompt=clean_prompt,
+                max_turns=14
+            )
+            self.db.save_chat(user_id, channel_id, "user", raw_user_text)
 
             async with message.channel.typing():
                 try:
@@ -271,10 +308,17 @@ class DiscordWorker:
                     self.db.add_joke(reply_text, added_by=self.profile.bot_name)
 
                 if len(reply_text) <= 2000:
-                    await message.reply(reply_text)
+                    if discord_mp3_file:
+                        await message.reply(reply_text, file=discord_mp3_file)
+                    else:
+                        await message.reply(reply_text)
                 else:
-                    for chunk in [reply_text[i:i + 1990] for i in range(0, len(reply_text), 1990)]:
-                        await message.channel.send(chunk)
+                    chunks = [reply_text[i:i + 1990] for i in range(0, len(reply_text), 1990)]
+                    for idx, chunk in enumerate(chunks):
+                        if idx == 0 and discord_mp3_file:
+                            await message.reply(chunk, file=discord_mp3_file)
+                        else:
+                            await message.channel.send(chunk)
 
             asyncio.create_task(self.engine.maybe_update_user_summary(user_id))
             await self.bot.process_commands(message)
