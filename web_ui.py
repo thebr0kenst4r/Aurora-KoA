@@ -1,8 +1,8 @@
 """
 web_ui.py
 Encapsulates the Streamlit multi-page application, multi-turn conversation memory,
-full-length hybrid song lookup (Local Vault -> Audius Full Tracks -> iTunes 30s Fallback)
-with 1-click convert to playable/downloadable .mp3,
+4-tier full-length hybrid song lookup (Local Vault -> Audius -> Internet Archive -> iTunes 30s Fallback)
+with 1-click convert to playable/downloadable .mp3 and ownership notice,
 6-Element KoA March & Planar Synergy Calculator (Fire, Ice, Wind, Earth, Light, Dark),
 separated Alliance (top) & Sovereign (bottom) sidebar authentication,
 customized Gaming/Realtor titles & strings, double-click st.data_editor tables,
@@ -24,6 +24,7 @@ from ai_engine import (
     GeminiEngine,
     SEARCH_TRIGGERS,
     REMEMBER_TRIGGERS,
+    AUDIO_OWNERSHIP_NOTICE,
     is_song_request,
     search_songs_hybrid,
     convert_audio_url_to_mp3_bytes
@@ -99,15 +100,16 @@ class StreamlitUI:
 
     def _render_track_cards(self, tracks: List[Dict[str, Any]], msg_index: int) -> None:
         """
-        Renders each matched song with a Full Track vs. 30s Preview badge,
-        inline audio player, and side-by-side Direct Stream + Convert to MP3 buttons.
+        Renders each matched song with its source badge, inline audio player,
+        and side-by-side Direct Stream + Convert to MP3 / Download MP3 buttons.
         """
         for idx, track in enumerate(tracks):
             tid = str(track.get("track_id", f"{msg_index}_{idx}"))
             stream_url = track.get("audio_url") or track.get("m4a_url", "")
             is_preview = bool(track.get("is_preview", False))
             dur = track.get("duration_str", "")
-            badge = "🟡 30s Preview" if is_preview else f"🟢 Full Track{f' ({dur})' if dur else ''}"
+            src_label = track.get("source_label", "Full Track")
+            badge = f"🟡 {src_label}" if is_preview else f"🟢 {src_label}{f' ({dur})' if dur else ''}"
             audio_fmt = "audio/mp4" if is_preview else "audio/mpeg"
 
             with st.container(border=True):
@@ -328,7 +330,7 @@ class StreamlitUI:
                         if inscribed:
                             st.toast(f"🌐 Auto-verified & inscribed: {inscribed}")
 
-            # 3-Tier Full-Length Song Lookup + 1-Click MP3 Conversion
+            # 4-Tier Full-Length Song Lookup + 1-Click MP3 Conversion
             found_tracks: List[Dict[str, Any]] = []
             if is_song_request(user_input):
                 with st.status("🎵 Searching celestial audio archives...", expanded=False):
@@ -350,12 +352,12 @@ class StreamlitUI:
                         "[SYSTEM AUDIO ATTACHMENT — Interactive player cards for ONLY these verified tracks render directly below your reply:\n"
                         f"{track_lines}\n"
                         "STRICT RULE: Do NOT output any URLs, hyperlinks, or [text](url) Markdown links in your text reply. "
-                        "List the exact titles above in character and tell the user they can play the stream or click 'Convert to MP3' right below.]"
+                        "List the exact titles above in character and let the user know they can play the stream or click 'Convert to MP3' right below.]"
                     )
                 else:
                     prompt_parts.append(
-                        "[SYSTEM AUDIO NOTICE: No verified playable stream was found for this song query. "
-                        "STRICT RULE: Do NOT invent, guess, or output any URLs or links. Apologize briefly in character and ask for the exact artist and song title.]"
+                        "[SYSTEM AUDIO NOTICE: No verified playable open/vault stream was found for this song query. "
+                        "STRICT RULE: Do NOT invent, guess, or output any URLs or links. Apologize briefly in character and ask for the exact artist and song title, or suggest adding a direct MP3 link to the Media Vault.]"
                     )
 
             if self.is_admin:
@@ -389,6 +391,9 @@ class StreamlitUI:
                         history_messages=history_for_model,
                         memory_context=ltm_context
                     )
+                    if found_tracks and "Audio Notice:" not in web_reply:
+                        web_reply = f"{web_reply}{AUDIO_OWNERSHIP_NOTICE}"
+
                     st.markdown(web_reply)
                     msg_idx = len(st.session_state.web_messages)
                     if found_tracks:
