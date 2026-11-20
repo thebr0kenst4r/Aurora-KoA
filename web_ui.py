@@ -1,7 +1,9 @@
 """
 web_ui.py
-Encapsulates the Streamlit multi-page application, separated Alliance (top) & Sovereign (bottom)
-sidebar authentication, customized Gaming/Realtor titles & strings, double-click st.data_editor tables,
+Encapsulates the Streamlit multi-page application, multi-turn conversation memory,
+hybrid song lookup (.m4a preview/link + 1-click convert to playable/downloadable .mp3),
+separated Alliance (top) & Sovereign (bottom) sidebar authentication,
+customized Gaming/Realtor titles & strings, double-click st.data_editor tables,
 the Interactive Mode, String & Persona Studio (with 1-click fallback to Python mode files),
 "Draft in Aurora's Voice" Discord broadcaster, and 1-click Project .zip Exporter.
 """
@@ -16,7 +18,14 @@ import streamlit as st
 
 from profiles import BotProfile, DomainConfig, get_secret_or_env
 from database import DatabaseManager
-from ai_engine import GeminiEngine, SEARCH_TRIGGERS
+from ai_engine import (
+    GeminiEngine,
+    SEARCH_TRIGGERS,
+    REMEMBER_TRIGGERS,
+    is_song_request,
+    search_songs_hybrid,
+    convert_m4a_url_to_mp3_bytes
+)
 from discord_worker import DiscordWorker
 
 
@@ -52,6 +61,12 @@ class StreamlitUI:
             ]
             st.session_state.last_mode = self.profile.mode_key
 
+        if "converted_mp3s" not in st.session_state:
+            st.session_state.converted_mp3s = {}
+
+        if "chat_cleared_at" not in st.session_state:
+            st.session_state.chat_cleared_at = None
+
     @property
     def is_admin(self) -> bool:
         return st.session_state.auth_role == "Sovereign"
@@ -59,6 +74,14 @@ class StreamlitUI:
     @property
     def is_member(self) -> bool:
         return st.session_state.auth_role in ("Member", "Sovereign")
+
+    @property
+    def active_web_user_id(self) -> str:
+        if self.is_admin:
+            return "sovereign_aerith"
+        if self.is_member:
+            return "alliance_member"
+        return "web_guest"
 
     def get_allowed_tiers(self) -> List[str]:
         if self.is_admin:
@@ -71,6 +94,58 @@ class StreamlitUI:
         banner = self.profile.render_dynamic_banner()
         if banner:
             st.markdown(banner, unsafe_allow_html=True)
+
+    def _render_track_cards(self, tracks: List[Dict[str, str]], msg_index: int) -> None:
+        """
+        Renders each matched song with its direct .m4a stream/link AND a 1-click
+        'Convert to Playable MP3' button right next to it.
+        """
+        for idx, track in enumerate(tracks):
+            tid = str(track.get("track_id", f"{msg_index}_{idx}"))
+            with st.container(border=True):
+                col_art, col_info = st.columns([1, 6])
+                with col_art:
+                    if track.get("artwork"):
+                        st.image(track["artwork"], width=68)
+                with col_info:
+                    st.markdown(f"**{track['title']}** — {track['artist']}")
+                    if track.get("album"):
+                        st.caption(track["album"])
+
+                # Row 1: Inline .m4a player + Direct .m4a link + Convert-to-MP3 button
+                c1, c2, c3 = st.columns([3, 1.4, 1.9])
+                with c1:
+                    st.audio(track["m4a_url"], format="audio/mp4")
+                with c2:
+                    st.link_button("🔗 Direct M4A", track["m4a_url"], width="stretch")
+                with c3:
+                    if tid not in st.session_state.converted_mp3s:
+                        if st.button("🎵 Convert to MP3", key=f"conv_mp3_{msg_index}_{idx}_{tid}", width="stretch"):
+                            with st.spinner("Transcoding M4A → Playable MP3..."):
+                                try:
+                                    mp3_bytes = convert_m4a_url_to_mp3_bytes(track["m4a_url"])
+                                    st.session_state.converted_mp3s[tid] = mp3_bytes
+                                    st.rerun()
+                                except Exception as conv_err:
+                                    st.error(f"MP3 conversion error: {conv_err}")
+                    else:
+                        st.success("Playable MP3 Ready", icon="✅")
+
+                # Row 2: Playable MP3 player + Download MP3 button once converted
+                if tid in st.session_state.converted_mp3s:
+                    mp3_data = st.session_state.converted_mp3s[tid]
+                    m_col1, m_col2 = st.columns([3, 1.9])
+                    with m_col1:
+                        st.audio(mp3_data, format="audio/mpeg")
+                    with m_col2:
+                        st.download_button(
+                            label="⬇️ Download MP3",
+                            data=mp3_data,
+                            file_name=track.get("mp3_filename", "track.mp3"),
+                            mime="audio/mpeg",
+                            key=f"dl_mp3_{msg_index}_{idx}_{tid}",
+                            width="stretch"
+                        )
 
     def render_sidebar_auth(self) -> None:
         """
@@ -125,7 +200,6 @@ class StreamlitUI:
                 )
                 st.success(badge_text)
 
-                # Allow Member to elevate to Sovereign from bottom expander if needed
                 if not self.is_admin:
                     with st.expander(self.profile.get_str("sovereign_section_title", "👑 Sovereign Sanctum Login"), expanded=False):
                         sov_pass = st.text_input(
@@ -146,7 +220,6 @@ class StreamlitUI:
                     st.query_params.clear()
                     st.rerun()
 
-            # Admin Quick Mode Switcher in Sidebar
             if self.is_admin:
                 st.divider()
                 st.caption("🎛️ **Admin Mode Switcher**")
@@ -182,17 +255,42 @@ class StreamlitUI:
                 st.session_state.web_messages = [
                     {"role": "assistant", "content": self.profile.welcome_message}
                 ]
+                st.session_state.chat_cleared_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 st.rerun()
 
-        for msg in st.session_state.web_messages:
+        # Render full conversation history + any attached song cards
+        for idx, msg in enumerate(st.session_state.web_messages):
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+                if msg.get("tracks"):
+                    self._render_track_cards(msg["tracks"], msg_index=idx)
 
         user_input = st.chat_input(self.profile.get_str("chat_input_placeholder", "Speak with Aurora..."))
         if user_input:
             st.session_state.web_messages.append({"role": "user", "content": user_input})
             with st.chat_message("user"):
                 st.markdown(user_input)
+
+            web_uid = self.active_web_user_id
+
+            # Zero-token direct memory commands in web chat (!profile / !note)
+            if user_input.startswith("!profile "):
+                facts = user_input.replace("!profile ", "").strip()
+                self.db.update_l1_profile(web_uid, facts)
+                reply = f"Celestial record inscribed into your profile: `{facts}`"
+                with st.chat_message("assistant"):
+                    st.markdown(reply)
+                st.session_state.web_messages.append({"role": "assistant", "content": reply})
+                st.rerun()
+
+            if user_input.startswith("!note "):
+                note_text = user_input.replace("!note ", "").strip()
+                self.db.add_l2_episode(web_uid, "Web Note", note_text)
+                reply = f"Episode anchored in long-term memory: `{note_text}`"
+                with st.chat_message("assistant"):
+                    st.markdown(reply)
+                st.session_state.web_messages.append({"role": "assistant", "content": reply})
+                st.rerun()
 
             strat_triggers = ["guide:", "mechanic:", "strategy:", "formula:"]
             if self.is_admin and self.profile.enable_auto_learn and any(k in user_input.lower() for k in strat_triggers):
@@ -206,34 +304,91 @@ class StreamlitUI:
                 )
                 st.toast(f"✨ Inscribed into Permanent Knowledge Records: {topic_key}")
 
+            # Build enriched prompt payload for the current turn
+            prompt_parts: List[str] = []
+
+            if any(rt in user_input.lower() for rt in REMEMBER_TRIGGERS):
+                deep_mem = self.db.get_deep_memory(web_uid)
+                prompt_parts.append(f"[Archived Memory Records:\n{deep_mem}]")
+
             local_strat = self.db.query_local_docs(user_input, allowed_tiers=self.get_allowed_tiers())
-            prompt_payload = f"{local_strat}\n{user_input}" if local_strat else user_input
+            if local_strat:
+                prompt_parts.append(local_strat)
 
             if any(s in user_input.lower() for s in SEARCH_TRIGGERS):
                 with st.status("🌐 Cross-referencing trusted sources & multi-domain intelligence...", expanded=False):
                     research_text, domains = self.engine.execute_multi_source_research(user_input)
                     if research_text:
-                        prompt_payload = f"{research_text}\n\n{prompt_payload}"
+                        prompt_parts.append(research_text)
                         inscribed = self.engine.process_knowledge_ingestion(
                             user_input, research_text, domains, is_sovereign_user=self.is_admin
                         )
                         if inscribed:
                             st.toast(f"🌐 Auto-verified & inscribed: {inscribed}")
 
+            # Hybrid Song Lookup (.m4a + 1-click MP3 conversion)
+            found_tracks: List[Dict[str, str]] = []
+            if is_song_request(user_input):
+                with st.status("🎵 Searching celestial audio archives...", expanded=False):
+                    try:
+                        found_tracks = search_songs_hybrid(user_input, limit=3)
+                    except Exception as song_err:
+                        st.toast(f"Audio search notice: {song_err}")
+
+                if found_tracks:
+                    track_lines = "\n".join(
+                        f"- {t['title']} by {t['artist']} (Album: {t['album']}) | Direct M4A: {t['m4a_url']}"
+                        for t in found_tracks
+                    )
+                    prompt_parts.append(
+                        "[Audio Tracks Located & Attached Below Your Reply — Present them naturally in character and let the user know they can play/download the .m4a directly or click 'Convert to MP3' right below your message]:\n"
+                        + track_lines
+                    )
+
             if self.is_admin:
-                prompt_payload = (
-                    f"[Speaking directly to your beloved Creator and Sovereign, {self.profile.creator_name}! "
-                    f"Recognize her with genuine excitement, warmth, and luminous pride while keeping your counsel sharp]:\n"
-                    f"{prompt_payload}"
+                prompt_parts.append(
+                    f"[Speaking directly to your beloved Creator and Sovereign, {self.profile.creator_name}. "
+                    f"Keep your counsel sharp, warm, and natural without repeating her name unnecessarily.]"
                 )
+
+            prompt_parts.append(user_input)
+            prompt_payload = "\n\n".join(prompt_parts)
+
+            # Pull persistent L1/L2 memory + fallback DB turns if session state was freshly booted
+            ltm_context = self.db.get_ltm_context(web_uid, user_input)
+            prior_session_msgs = st.session_state.web_messages[:-1]
+            if len(prior_session_msgs) <= 1:
+                db_turns = self.db.get_active_user_context(
+                    web_uid,
+                    user_input,
+                    timeout_minutes=120,
+                    max_turns=12,
+                    char_limit=1800,
+                    since_timestamp=st.session_state.chat_cleared_at
+                )
+                history_for_model = db_turns
+            else:
+                history_for_model = prior_session_msgs
 
             with st.chat_message("assistant"):
                 with st.spinner(f"{self.profile.bot_name} is weaving a response..."):
-                    web_reply = self.engine.call_gemini_sync(prompt_payload)
+                    web_reply = self.engine.call_gemini_sync(
+                        prompt_payload=prompt_payload,
+                        history_messages=history_for_model,
+                        memory_context=ltm_context
+                    )
                     st.markdown(web_reply)
-                    st.session_state.web_messages.append({"role": "assistant", "content": web_reply})
-                    self.db.save_chat("web_user", "streamlit_web", "user", user_input)
-                    self.db.save_chat("web_user", "streamlit_web", "model", web_reply)
+                    msg_idx = len(st.session_state.web_messages)
+                    if found_tracks:
+                        self._render_track_cards(found_tracks, msg_index=msg_idx)
+
+                    assistant_record: Dict[str, Any] = {"role": "assistant", "content": web_reply}
+                    if found_tracks:
+                        assistant_record["tracks"] = found_tracks
+                    st.session_state.web_messages.append(assistant_record)
+
+                    self.db.save_chat(web_uid, "streamlit_web", "user", user_input)
+                    self.db.save_chat(web_uid, "streamlit_web", "model", web_reply)
 
     # =========================================================================
     # PAGE 2: STRATEGIES & LORE ARCHIVES
