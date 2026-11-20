@@ -521,7 +521,7 @@ class DatabaseManager:
         self.trigger_background_sync(force=False, reason="Summary update")
 
     def get_ltm_context(self, user_id: str, prompt: str) -> str:
-        """Retrieves L1 Profile facts and selective L2 Episodic notes matching prompt keywords ($0 tokens)."""
+        """Retrieves L1 Profile facts, selective L2 Episodic notes, and rolling summary ($0 tokens)."""
         conn = self._get_conn()
         c = conn.cursor()
 
@@ -529,12 +529,16 @@ class DatabaseManager:
         p_row = c.fetchone()
         l1_profile = p_row[0] if p_row else ""
 
+        c.execute("SELECT summary FROM user_summaries WHERE user_id = ?", (str(user_id),))
+        s_row = c.fetchone()
+        summary = s_row[0] if s_row else ""
+
         words = [w.lower() for w in re.findall(r"\w+", prompt) if len(w) > 3]
         episodes = []
         if words:
             placeholders = " OR ".join(["content LIKE ?" for _ in words[:4]])
             params = [str(user_id)] + [f"%{w}%" for w in words[:4]]
-            query = f"SELECT topic, content FROM episodic_memory WHERE user_id = ? AND ({placeholders}) ORDER BY id DESC LIMIT 2"
+            query = f"SELECT topic, content FROM episodic_memory WHERE user_id = ? AND ({placeholders}) ORDER BY id DESC LIMIT 3"
             c.execute(query, params)
             episodes = c.fetchall()
 
@@ -546,40 +550,63 @@ class DatabaseManager:
         if episodes:
             ep_text = "; ".join([f"{top}: {con}" for top, con in episodes])
             injections.append(f"[Recalled Past Episodes: {ep_text}]")
+        if summary:
+            injections.append(f"[Persistent Knowledge of User: {summary}]")
 
         return "\n".join(injections)
 
-    def get_active_user_context(self, user_id: str, prompt: str, timeout_minutes: int = 25, max_turns: int = 2, char_limit: int = 350) -> List[Dict[str, Any]]:
+    def get_active_user_context(
+        self,
+        user_id: str,
+        prompt: str,
+        timeout_minutes: int = 120,
+        max_turns: int = 14,
+        char_limit: int = 1800,
+        since_timestamp: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetches expanded multi-turn user history within the active window (default 14 turns / 2 hours)
+        and prepends L1/L2 + rolling summary as a valid user/model context pair.
+        """
         conn = self._get_conn()
         c = conn.cursor()
 
-        c.execute("SELECT summary FROM user_summaries WHERE user_id = ?", (str(user_id),))
-        s_row = c.fetchone()
-        summary = s_row[0] if s_row else ""
-
-        c.execute(
-            """
-            SELECT role, content FROM user_chat
-            WHERE user_id = ?
-              AND timestamp >= datetime('now', '-' || ? || ' minutes')
-            ORDER BY id DESC LIMIT ?
-            """,
-            (str(user_id), timeout_minutes, max_turns)
-        )
+        if since_timestamp:
+            c.execute(
+                """
+                SELECT role, content FROM user_chat
+                WHERE user_id = ?
+                  AND timestamp >= ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (str(user_id), since_timestamp, max_turns)
+            )
+        else:
+            c.execute(
+                """
+                SELECT role, content FROM user_chat
+                WHERE user_id = ?
+                  AND timestamp >= datetime('now', '-' || ? || ' minutes')
+                ORDER BY id DESC LIMIT ?
+                """,
+                (str(user_id), timeout_minutes, max_turns)
+            )
         rows = c.fetchall()
         conn.close()
 
         formatted: List[Dict[str, Any]] = []
         ltm_snippet = self.get_ltm_context(user_id, prompt)
         if ltm_snippet:
-            formatted.append({"role": "model", "parts": [{"text": ltm_snippet}]})
-
-        if summary:
-            formatted.append({"role": "model", "parts": [{"text": f"[Persistent Knowledge of User: {summary}]"}]})
+            formatted.append({"role": "user", "parts": [{"text": f"[Context & Memory Notes]\n{ltm_snippet}"}]})
+            formatted.append({"role": "model", "parts": [{"text": "Understood. I have these records in mind."}]})
 
         for role, content in reversed(rows):
+            sdk_role = "model" if role in ("model", "assistant") else "user"
             clipped = content[:char_limit] + ("..." if len(content) > char_limit else "")
-            formatted.append({"role": role, "parts": [{"text": clipped}]})
+            if formatted and formatted[-1]["role"] == sdk_role:
+                formatted[-1]["parts"][0]["text"] += f"\n\n{clipped}"
+            else:
+                formatted.append({"role": sdk_role, "parts": [{"text": clipped}]})
 
         return formatted
 
@@ -597,7 +624,7 @@ class DatabaseManager:
         c.execute("SELECT topic, content, timestamp FROM episodic_memory WHERE user_id = ? ORDER BY id DESC LIMIT 5", (str(user_id),))
         episodes = c.fetchall()
 
-        c.execute("SELECT role, content, timestamp FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 8", (str(user_id),))
+        c.execute("SELECT role, content, timestamp FROM user_chat WHERE user_id = ? ORDER BY id DESC LIMIT 12", (str(user_id),))
         history = c.fetchall()
         conn.close()
 
@@ -610,7 +637,7 @@ class DatabaseManager:
             lines.append(f"  [{ts}] {top}: {con}")
         lines.append("- Recent Raw Dialogues:")
         for role, content, ts in reversed(history):
-            lines.append(f"  [{ts}] {role}: {content[:140]}")
+            lines.append(f"  [{ts}] {role}: {content[:200]}")
         return "\n".join(lines)
 
     # --- KNOWLEDGE BASE, STRATEGY DOCS & DATA_EDITOR BULK SYNC ---
