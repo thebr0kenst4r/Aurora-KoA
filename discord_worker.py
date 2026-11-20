@@ -2,7 +2,7 @@
 discord_worker.py
 Encapsulates the optional Discord bot instance, event listeners (on_ready, on_message,
 on_raw_reaction_add), Zero-Token Reaction Pin Learning (📌 / 🌟 / ⭐), !learn command,
-Silence Protocol, hostility defense overrides, hybrid song MP3 delivery,
+Silence Protocol, hostility defense overrides, full-length hybrid song MP3 delivery,
 and cross-thread message broadcaster.
 """
 
@@ -10,7 +10,7 @@ import io
 import random
 import asyncio
 import threading
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 import discord
 from discord.ext import commands
 
@@ -23,7 +23,7 @@ from ai_engine import (
     SILENCE_TRIGGERS,
     is_song_request,
     search_songs_hybrid,
-    convert_m4a_url_to_mp3_bytes
+    convert_audio_url_to_mp3_bytes
 )
 
 LEARN_REACTION_EMOJIS = {"📌", "🌟", "⭐"}
@@ -247,22 +247,33 @@ class DiscordWorker:
                     clean_prompt = f"{research_text}\n\n{clean_prompt}"
                     self.engine.process_knowledge_ingestion(clean_prompt, research_text, domains, is_sovereign_user=is_sov)
 
-            # 10b. Hybrid Song Lookup & MP3 Transcoding for Discord
+            # 10b. Hybrid Full-Length Song Lookup & MP3 Transcoding for Discord
             discord_mp3_file: Optional[discord.File] = None
-            matched_tracks: List[Dict[str, str]] = []
+            matched_tracks: List[Dict[str, Any]] = []
             if is_song_request(raw_user_text):
                 try:
-                    matched_tracks = await asyncio.to_thread(search_songs_hybrid, raw_user_text, 2)
+                    matched_tracks = await asyncio.to_thread(
+                        search_songs_hybrid,
+                        raw_user_text,
+                        2,
+                        self.db.get_all_media()
+                    )
                     if matched_tracks:
                         top_track = matched_tracks[0]
-                        mp3_bytes = await asyncio.to_thread(convert_m4a_url_to_mp3_bytes, top_track["m4a_url"])
+                        stream_url = top_track.get("audio_url") or top_track.get("m4a_url", "")
+                        mp3_bytes = await asyncio.to_thread(
+                            convert_audio_url_to_mp3_bytes,
+                            stream_url,
+                            "192k",
+                            7_500_000
+                        )
                         discord_mp3_file = discord.File(
                             io.BytesIO(mp3_bytes),
                             filename=top_track["mp3_filename"]
                         )
                         clean_prompt = (
                             f"[Audio Track Located & Attached as Playable MP3 File '{top_track['mp3_filename']}': "
-                            f"{top_track['title']} by {top_track['artist']} | Direct M4A: {top_track['m4a_url']}]\n"
+                            f"{top_track['title']} by {top_track['artist']} ({top_track['source_label']})]\n"
                             f"{clean_prompt}"
                         )
                 except Exception as audio_err:
