@@ -2,8 +2,8 @@
 discord_worker.py
 Encapsulates the optional Discord bot instance, event listeners (on_ready, on_message,
 on_raw_reaction_add), Zero-Token Reaction Pin Learning (📌 / 🌟 / ⭐), !learn command,
-Silence Protocol, hostility defense overrides, full-length hybrid song MP3 delivery,
-and cross-thread message broadcaster.
+Silence Protocol, hostility defense overrides, 4-tier hybrid song MP3 delivery with
+ownership notice, and cross-thread message broadcaster.
 """
 
 import io
@@ -21,6 +21,7 @@ from ai_engine import (
     SEARCH_TRIGGERS,
     REMEMBER_TRIGGERS,
     SILENCE_TRIGGERS,
+    AUDIO_OWNERSHIP_NOTICE,
     is_song_request,
     search_songs_hybrid,
     convert_audio_url_to_mp3_bytes
@@ -247,7 +248,7 @@ class DiscordWorker:
                     clean_prompt = f"{research_text}\n\n{clean_prompt}"
                     self.engine.process_knowledge_ingestion(clean_prompt, research_text, domains, is_sovereign_user=is_sov)
 
-            # 10b. Hybrid Full-Length Song Lookup & MP3 Transcoding for Discord
+            # 10b. 4-Tier Hybrid Song Lookup & Playable MP3 Attachment for Discord
             discord_mp3_file: Optional[discord.File] = None
             matched_tracks: List[Dict[str, Any]] = []
             if is_song_request(raw_user_text):
@@ -272,8 +273,15 @@ class DiscordWorker:
                             filename=top_track["mp3_filename"]
                         )
                         clean_prompt = (
-                            f"[Audio Track Located & Attached as Playable MP3 File '{top_track['mp3_filename']}': "
-                            f"{top_track['title']} by {top_track['artist']} ({top_track['source_label']})]\n"
+                            f"[SYSTEM AUDIO ATTACHMENT — Playable MP3 file '{top_track['mp3_filename']}' "
+                            f"({top_track['title']} by {top_track['artist']} — {top_track['source_label']}) is attached directly to this Discord message. "
+                            f"STRICT RULE: Do NOT output any URLs or hyperlinks in your text reply.]\n"
+                            f"{clean_prompt}"
+                        )
+                    else:
+                        clean_prompt = (
+                            "[SYSTEM AUDIO NOTICE: No verified playable open/vault stream was found for this song query. "
+                            "STRICT RULE: Do NOT invent or output any URLs or links.]\n"
                             f"{clean_prompt}"
                         )
                 except Exception as audio_err:
@@ -312,6 +320,9 @@ class DiscordWorker:
                         reply_text = "The cosmic resonance stream across all keys is currently exhausted. Please give the ley lines a moment to replenish."
                     else:
                         reply_text = f"A rift occurred in the resonance stream: `{e}`"
+
+                if matched_tracks and "Audio Notice:" not in reply_text:
+                    reply_text = f"{reply_text}{AUDIO_OWNERSHIP_NOTICE}"
 
                 self.db.save_chat(user_id, channel_id, "model", reply_text)
 
