@@ -3,6 +3,7 @@ web_ui.py
 Encapsulates the Streamlit multi-page application, multi-turn conversation memory,
 full-length hybrid song lookup (Local Vault -> Audius Full Tracks -> iTunes 30s Fallback)
 with 1-click convert to playable/downloadable .mp3,
+6-Element KoA March & Planar Synergy Calculator (Fire, Ice, Wind, Earth, Light, Dark),
 separated Alliance (top) & Sovereign (bottom) sidebar authentication,
 customized Gaming/Realtor titles & strings, double-click st.data_editor tables,
 the Interactive Mode, String & Persona Studio (with 1-click fallback to Python mode files),
@@ -98,15 +99,15 @@ class StreamlitUI:
 
     def _render_track_cards(self, tracks: List[Dict[str, Any]], msg_index: int) -> None:
         """
-        Renders each matched song with a Full Track vs. 30s Preview indicator,
-        inline stream player, direct stream link, and 1-click 'Convert to MP3' button.
+        Renders each matched song with a Full Track vs. 30s Preview badge,
+        inline audio player, and side-by-side Direct Stream + Convert to MP3 buttons.
         """
         for idx, track in enumerate(tracks):
             tid = str(track.get("track_id", f"{msg_index}_{idx}"))
             stream_url = track.get("audio_url") or track.get("m4a_url", "")
             is_preview = bool(track.get("is_preview", False))
             dur = track.get("duration_str", "")
-            badge = f"🟡 30s Preview" if is_preview else f"🟢 Full Track{f' ({dur})' if dur else ''}"
+            badge = "🟡 30s Preview" if is_preview else f"🟢 Full Track{f' ({dur})' if dur else ''}"
             audio_fmt = "audio/mp4" if is_preview else "audio/mpeg"
 
             with st.container(border=True):
@@ -119,13 +120,12 @@ class StreamlitUI:
                     if track.get("album"):
                         st.caption(track["album"])
 
-                # Row 1: Inline Stream Player + Direct Stream Link + Convert-to-MP3 Button
-                c1, c2, c3 = st.columns([3, 1.4, 1.9])
-                with c1:
-                    st.audio(stream_url, format=audio_fmt)
-                with c2:
+                st.audio(stream_url, format=audio_fmt)
+
+                btn_col1, btn_col2 = st.columns(2)
+                with btn_col1:
                     st.link_button("🔗 Direct Stream", stream_url, width="stretch")
-                with c3:
+                with btn_col2:
                     if tid not in st.session_state.converted_mp3s:
                         if st.button("🎵 Convert to MP3", key=f"conv_mp3_{msg_index}_{idx}_{tid}", width="stretch"):
                             with st.spinner("Downloading & encoding playable MP3..."):
@@ -136,23 +136,19 @@ class StreamlitUI:
                                 except Exception as conv_err:
                                     st.error(f"MP3 conversion error: {conv_err}")
                     else:
-                        st.success("Playable MP3 Ready", icon="✅")
+                        st.success("MP3 Ready ✅")
 
-                # Row 2: Playable MP3 Player + Download MP3 Button once prepared
                 if tid in st.session_state.converted_mp3s:
                     mp3_data = st.session_state.converted_mp3s[tid]
-                    m_col1, m_col2 = st.columns([3, 1.9])
-                    with m_col1:
-                        st.audio(mp3_data, format="audio/mpeg")
-                    with m_col2:
-                        st.download_button(
-                            label="⬇️ Download MP3",
-                            data=mp3_data,
-                            file_name=track.get("mp3_filename", "track.mp3"),
-                            mime="audio/mpeg",
-                            key=f"dl_mp3_{msg_index}_{idx}_{tid}",
-                            width="stretch"
-                        )
+                    st.audio(mp3_data, format="audio/mpeg")
+                    st.download_button(
+                        label="⬇️ Download MP3 File",
+                        data=mp3_data,
+                        file_name=track.get("mp3_filename", "track.mp3"),
+                        mime="audio/mpeg",
+                        key=f"dl_mp3_{msg_index}_{idx}_{tid}",
+                        width="stretch"
+                    )
 
     def render_sidebar_auth(self) -> None:
         """
@@ -335,7 +331,7 @@ class StreamlitUI:
             # 3-Tier Full-Length Song Lookup + 1-Click MP3 Conversion
             found_tracks: List[Dict[str, Any]] = []
             if is_song_request(user_input):
-                with st.status("🎵 Searching celestial audio archives for full tracks...", expanded=False):
+                with st.status("🎵 Searching celestial audio archives...", expanded=False):
                     try:
                         found_tracks = search_songs_hybrid(
                             user_input,
@@ -351,8 +347,15 @@ class StreamlitUI:
                         for t in found_tracks
                     )
                     prompt_parts.append(
-                        "[Audio Tracks Located & Attached Below Your Reply — Present them naturally in character and let the user know they can stream directly or click 'Convert to MP3' right below your message]:\n"
-                        + track_lines
+                        "[SYSTEM AUDIO ATTACHMENT — Interactive player cards for ONLY these verified tracks render directly below your reply:\n"
+                        f"{track_lines}\n"
+                        "STRICT RULE: Do NOT output any URLs, hyperlinks, or [text](url) Markdown links in your text reply. "
+                        "List the exact titles above in character and tell the user they can play the stream or click 'Convert to MP3' right below.]"
+                    )
+                else:
+                    prompt_parts.append(
+                        "[SYSTEM AUDIO NOTICE: No verified playable stream was found for this song query. "
+                        "STRICT RULE: Do NOT invent, guess, or output any URLs or links. Apologize briefly in character and ask for the exact artist and song title.]"
                     )
 
             if self.is_admin:
@@ -459,13 +462,15 @@ class StreamlitUI:
                     "Standard Balanced Rally (45% Inf / 27% Cav / 28% Bow)",
                     "Heavy Sanctum / Garrison Anchor (55% Inf / 20% Cav / 25% Bow)",
                     "High-Burst Flank Strike (38% Inf / 35% Cav / 27% Bow)",
+                    "Light / Dark Planar Burst (42% Inf / 30% Cav / 28% Bow)",
                     "Golem / Single-Target Boss (1% Inf / 44% Cav / 55% Bow)",
                     "Custom Ratio"
                 ]
             )
         with col2:
-            my_element = st.selectbox("Your Primary Planar Element:", ["Fire 🔥", "Ice ❄️", "Wind 🌪️", "Earth 🪨"])
-            enemy_element = st.selectbox("Target / Enemy Element:", ["Fire 🔥", "Ice ❄️", "Wind 🌪️", "Earth 🪨"])
+            element_options = ["Fire 🔥", "Ice ❄️", "Wind 🌪️", "Earth 🪨", "Light ☀️", "Dark 🌑"]
+            my_element = st.selectbox("Your Primary Planar Element:", element_options)
+            enemy_element = st.selectbox("Target / Enemy Element:", element_options)
 
         if "Standard" in preset:
             inf_pct, cav_pct, bow_pct = 45, 27, 28
@@ -473,6 +478,8 @@ class StreamlitUI:
             inf_pct, cav_pct, bow_pct = 55, 20, 25
         elif "High-Burst" in preset:
             inf_pct, cav_pct, bow_pct = 38, 35, 27
+        elif "Planar Burst" in preset:
+            inf_pct, cav_pct, bow_pct = 42, 30, 28
         elif "Golem" in preset:
             inf_pct, cav_pct, bow_pct = 1, 44, 55
         else:
@@ -492,13 +499,51 @@ class StreamlitUI:
         m2.metric("🐎 Cavalry Flank", f"{cav_count:,}", f"{cav_pct}% (Main: {int(cav_count*0.75):,} | Cushion: {int(cav_count*0.25):,})")
         m3.metric("🏹 Bowmen Backline", f"{bow_count:,}", f"{bow_pct}% (Main: {int(bow_count*0.80):,} | Cushion: {int(bow_count*0.20):,})")
 
-        counters = {"Ice ❄️": "Fire 🔥", "Fire 🔥": "Wind 🌪️", "Wind 🌪️": "Earth 🪨", "Earth 🪨": "Ice ❄️"}
-        if counters.get(my_element) == enemy_element:
-            st.success(f"🌟 **Elemental Advantage Active ({my_element} counters {enemy_element}):** +15% Planar Damage & Mitigation resonance!")
-        elif counters.get(enemy_element) == my_element:
-            st.warning(f"⚠️ **Elemental Disadvantage ({enemy_element} counters {my_element}):** Increase Infantry frontline cushion by +5% to absorb burst.")
+        # 6-Element KoA Planar Resonance & Counter Evaluation
+        primal_counters = {
+            "Ice ❄️": "Fire 🔥",
+            "Fire 🔥": "Wind 🌪️",
+            "Wind 🌪️": "Earth 🪨",
+            "Earth 🪨": "Ice ❄️",
+        }
+        celestial_pair = {"Light ☀️", "Dark 🌑"}
+
+        if {my_element, enemy_element} == celestial_pair:
+            st.warning(
+                f"⚡ **Celestial Duality Clash ({my_element} ↔ {enemy_element}):** "
+                "Light and Dark mutually counter each other with amplified Planar Damage! "
+                "Both marches deal heightened burst—reinforce Infantry frontline (+3–5%) and prioritize Planar Resistance & Penetration."
+            )
+        elif my_element in celestial_pair and enemy_element not in celestial_pair:
+            st.success(
+                f"✨ **Transcendent Planar Advantage ({my_element} vs {enemy_element}):** "
+                f"{my_element} sits outside the 4-element primal cycle—immune to primal counter penalties while retaining full Planar Resonance."
+            )
+        elif enemy_element in celestial_pair and my_element not in celestial_pair:
+            st.info(
+                f"🌌 **Primal vs. Celestial Matchup ({my_element} vs {enemy_element}):** "
+                f"{enemy_element} bypasses standard primal counter disadvantages. Rely on raw troop stats, Planar Resistance, and frontline cushion."
+            )
+        elif primal_counters.get(my_element) == enemy_element:
+            st.success(
+                f"🌟 **Elemental Advantage Active ({my_element} counters {enemy_element}):** "
+                "+15% Planar Damage & Mitigation resonance!"
+            )
+        elif primal_counters.get(enemy_element) == my_element:
+            st.warning(
+                f"⚠️ **Elemental Disadvantage ({enemy_element} counters {my_element}):** "
+                "Increase Infantry frontline cushion by +5% to absorb burst."
+            )
         else:
-            st.info(f"⚖️ **Neutral Elemental Matchup ({my_element} vs {enemy_element}):** Standard lethality multipliers apply.")
+            st.info(
+                f"⚖️ **Neutral Elemental Matchup ({my_element} vs {enemy_element}):** "
+                "Standard lethality and Planar Penetration multipliers apply."
+            )
+
+        st.caption(
+            "**6-Element Planar Matrix:** `❄️ Ice > 🔥 Fire > 🌪️ Wind > 🪨 Earth > ❄️ Ice`  |  "
+            "`☀️ Light ↔ 🌑 Dark` (Mutual Planar Counter; transcendent to the 4 primal elements)"
+        )
 
     def _render_realtor_mortgage_calculator(self) -> None:
         col1, col2, col3 = st.columns(3)
