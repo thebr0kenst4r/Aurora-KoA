@@ -1,7 +1,8 @@
 """
 web_ui.py
 Encapsulates the Streamlit multi-page application, multi-turn conversation memory,
-hybrid song lookup (.m4a preview/link + 1-click convert to playable/downloadable .mp3),
+full-length hybrid song lookup (Local Vault -> Audius Full Tracks -> iTunes 30s Fallback)
+with 1-click convert to playable/downloadable .mp3,
 separated Alliance (top) & Sovereign (bottom) sidebar authentication,
 customized Gaming/Realtor titles & strings, double-click st.data_editor tables,
 the Interactive Mode, String & Persona Studio (with 1-click fallback to Python mode files),
@@ -24,7 +25,7 @@ from ai_engine import (
     REMEMBER_TRIGGERS,
     is_song_request,
     search_songs_hybrid,
-    convert_m4a_url_to_mp3_bytes
+    convert_audio_url_to_mp3_bytes
 )
 from discord_worker import DiscordWorker
 
@@ -95,35 +96,41 @@ class StreamlitUI:
         if banner:
             st.markdown(banner, unsafe_allow_html=True)
 
-    def _render_track_cards(self, tracks: List[Dict[str, str]], msg_index: int) -> None:
+    def _render_track_cards(self, tracks: List[Dict[str, Any]], msg_index: int) -> None:
         """
-        Renders each matched song with its direct .m4a stream/link AND a 1-click
-        'Convert to Playable MP3' button right next to it.
+        Renders each matched song with a Full Track vs. 30s Preview indicator,
+        inline stream player, direct stream link, and 1-click 'Convert to MP3' button.
         """
         for idx, track in enumerate(tracks):
             tid = str(track.get("track_id", f"{msg_index}_{idx}"))
+            stream_url = track.get("audio_url") or track.get("m4a_url", "")
+            is_preview = bool(track.get("is_preview", False))
+            dur = track.get("duration_str", "")
+            badge = f"🟡 30s Preview" if is_preview else f"🟢 Full Track{f' ({dur})' if dur else ''}"
+            audio_fmt = "audio/mp4" if is_preview else "audio/mpeg"
+
             with st.container(border=True):
                 col_art, col_info = st.columns([1, 6])
                 with col_art:
                     if track.get("artwork"):
                         st.image(track["artwork"], width=68)
                 with col_info:
-                    st.markdown(f"**{track['title']}** — {track['artist']}")
+                    st.markdown(f"**{track['title']}** — {track['artist']}  `{badge}`")
                     if track.get("album"):
                         st.caption(track["album"])
 
-                # Row 1: Inline .m4a player + Direct .m4a link + Convert-to-MP3 button
+                # Row 1: Inline Stream Player + Direct Stream Link + Convert-to-MP3 Button
                 c1, c2, c3 = st.columns([3, 1.4, 1.9])
                 with c1:
-                    st.audio(track["m4a_url"], format="audio/mp4")
+                    st.audio(stream_url, format=audio_fmt)
                 with c2:
-                    st.link_button("🔗 Direct M4A", track["m4a_url"], width="stretch")
+                    st.link_button("🔗 Direct Stream", stream_url, width="stretch")
                 with c3:
                     if tid not in st.session_state.converted_mp3s:
                         if st.button("🎵 Convert to MP3", key=f"conv_mp3_{msg_index}_{idx}_{tid}", width="stretch"):
-                            with st.spinner("Transcoding M4A → Playable MP3..."):
+                            with st.spinner("Downloading & encoding playable MP3..."):
                                 try:
-                                    mp3_bytes = convert_m4a_url_to_mp3_bytes(track["m4a_url"])
+                                    mp3_bytes = convert_audio_url_to_mp3_bytes(stream_url)
                                     st.session_state.converted_mp3s[tid] = mp3_bytes
                                     st.rerun()
                                 except Exception as conv_err:
@@ -131,7 +138,7 @@ class StreamlitUI:
                     else:
                         st.success("Playable MP3 Ready", icon="✅")
 
-                # Row 2: Playable MP3 player + Download MP3 button once converted
+                # Row 2: Playable MP3 Player + Download MP3 Button once prepared
                 if tid in st.session_state.converted_mp3s:
                     mp3_data = st.session_state.converted_mp3s[tid]
                     m_col1, m_col2 = st.columns([3, 1.9])
@@ -304,7 +311,6 @@ class StreamlitUI:
                 )
                 st.toast(f"✨ Inscribed into Permanent Knowledge Records: {topic_key}")
 
-            # Build enriched prompt payload for the current turn
             prompt_parts: List[str] = []
 
             if any(rt in user_input.lower() for rt in REMEMBER_TRIGGERS):
@@ -326,22 +332,26 @@ class StreamlitUI:
                         if inscribed:
                             st.toast(f"🌐 Auto-verified & inscribed: {inscribed}")
 
-            # Hybrid Song Lookup (.m4a + 1-click MP3 conversion)
-            found_tracks: List[Dict[str, str]] = []
+            # 3-Tier Full-Length Song Lookup + 1-Click MP3 Conversion
+            found_tracks: List[Dict[str, Any]] = []
             if is_song_request(user_input):
-                with st.status("🎵 Searching celestial audio archives...", expanded=False):
+                with st.status("🎵 Searching celestial audio archives for full tracks...", expanded=False):
                     try:
-                        found_tracks = search_songs_hybrid(user_input, limit=3)
+                        found_tracks = search_songs_hybrid(
+                            user_input,
+                            limit=3,
+                            local_media=self.db.get_all_media()
+                        )
                     except Exception as song_err:
                         st.toast(f"Audio search notice: {song_err}")
 
                 if found_tracks:
                     track_lines = "\n".join(
-                        f"- {t['title']} by {t['artist']} (Album: {t['album']}) | Direct M4A: {t['m4a_url']}"
+                        f"- {t['title']} by {t['artist']} ({t['source_label']})"
                         for t in found_tracks
                     )
                     prompt_parts.append(
-                        "[Audio Tracks Located & Attached Below Your Reply — Present them naturally in character and let the user know they can play/download the .m4a directly or click 'Convert to MP3' right below your message]:\n"
+                        "[Audio Tracks Located & Attached Below Your Reply — Present them naturally in character and let the user know they can stream directly or click 'Convert to MP3' right below your message]:\n"
                         + track_lines
                     )
 
@@ -354,7 +364,6 @@ class StreamlitUI:
             prompt_parts.append(user_input)
             prompt_payload = "\n\n".join(prompt_parts)
 
-            # Pull persistent L1/L2 memory + fallback DB turns if session state was freshly booted
             ltm_context = self.db.get_ltm_context(web_uid, user_input)
             prior_session_msgs = st.session_state.web_messages[:-1]
             if len(prior_session_msgs) <= 1:
@@ -645,10 +654,10 @@ class StreamlitUI:
 
             st.divider()
             with st.form("add_media_form"):
-                st.subheader("Add Multimedia Stream / Link")
+                st.subheader("Add Multimedia Stream / Direct MP3 Link")
                 m_title = st.text_input("Media Title:")
                 m_cat = st.text_input("Category:", value="Music")
-                m_url = st.text_input("YouTube or Resource URL:")
+                m_url = st.text_input("YouTube or Direct MP3/M4A URL:")
                 m_desc = st.text_input("Short Description:")
                 if st.form_submit_button("Add Media Item", width="stretch"):
                     if m_title and m_url:
