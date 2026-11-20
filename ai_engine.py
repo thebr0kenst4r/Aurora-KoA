@@ -2,7 +2,7 @@
 ai_engine.py
 Encapsulates the thread-safe Gemini API client rotation pool, retry backoff,
 multi-turn conversation history builder (with strict user/model role alternation),
-full-length hybrid song lookup (Local Vault -> Audius Full Tracks -> iTunes 30s Fallback)
+4-tier full-length hybrid song lookup (Local Vault -> Audius -> Internet Archive -> iTunes 30s Fallback)
 with relevance scoring, HTTP 404 stream filtering, and in-memory FFmpeg .mp3 transcoding,
 4-method zero-quota web verification suite, trusted-domain verification,
 voice drafting for Discord broadcasts, and the Autonomous King of Avalon Update Scout.
@@ -46,6 +46,13 @@ GAME_NON_MUSIC_WORDS = [
     "koa", "king of avalon", "kvk", "rally", "frost drake", "dragon", "troop", "march",
     "fae", "sanctum", "alliance", "excalibur", "spire", "emblem", "hero", "golem"
 ]
+
+AUDIO_OWNERSHIP_NOTICE = (
+    "\n\n---\n"
+    "*⚖️ Audio Notice: Streams and MP3 conversions are provided for personal listening of "
+    "public-domain, Creative Commons, or personally owned/licensed recordings. Please ensure you "
+    "own or hold valid rights to a track before downloading.*"
+)
 
 _CACHED_AUDIUS_HOSTS: List[str] = []
 
@@ -91,7 +98,9 @@ def extract_song_queries(text: str) -> Tuple[str, str]:
 
 def _format_duration(seconds: Any) -> str:
     try:
-        sec = int(seconds or 0)
+        if isinstance(seconds, str) and ":" in seconds:
+            return seconds.strip()
+        sec = int(float(seconds or 0))
         if sec <= 0:
             return ""
         mins, rem = divmod(sec, 60)
@@ -133,17 +142,17 @@ def _is_stream_reachable(url: str) -> bool:
 
 
 def _score_track_relevance(track: Dict[str, Any], query_tokens: List[str]) -> int:
-    """Ranks tracks higher when both requested artist and title words match."""
+    """Ranks tracks higher when both requested artist and title words match, favoring full tracks."""
     if not query_tokens:
         return 0
     haystack = f"{track.get('title', '')} {track.get('artist', '')}".lower()
     matched = sum(1 for tok in query_tokens if tok in haystack)
-    bonus = 2 if not track.get("is_preview", True) else 0
+    bonus = 3 if not track.get("is_preview", True) else 0
     return (matched * 10) + bonus
 
 
 def _search_audius_full_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Queries Audius Open Music API for full-length downloadable/streamable songs."""
+    """Tier 2: Queries Audius Open Music API for full-length downloadable/streamable songs."""
     for host in _get_audius_hosts():
         try:
             resp = requests.get(
@@ -172,14 +181,14 @@ def _search_audius_full_tracks(search_term: str, limit: int = 3) -> List[Dict[st
                     "track_id": f"audius_{tid}",
                     "title": title,
                     "artist": artist,
-                    "album": item.get("genre") or "Full Track Stream",
+                    "album": item.get("genre") or "Audius Open Stream",
                     "artwork": artwork_url,
                     "audio_url": stream_url,
                     "m4a_url": stream_url,
                     "mp3_filename": f"{safe_name}.mp3",
                     "is_preview": False,
                     "duration_str": _format_duration(duration_sec),
-                    "source_label": "Full Track",
+                    "source_label": "Full Track (Audius)",
                 })
                 if len(tracks) >= limit * 2:
                     break
@@ -190,8 +199,86 @@ def _search_audius_full_tracks(search_term: str, limit: int = 3) -> List[Dict[st
     return []
 
 
+def _search_internet_archive_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """
+    Tier 3: Queries the Internet Archive (archive.org) for full-length public-domain,
+    live recording, and Creative Commons .mp3 tracks with zero API keys.
+    """
+    tracks: List[Dict[str, Any]] = []
+    try:
+        search_resp = requests.get(
+            "https://archive.org/advancedsearch.php",
+            params={
+                "q": f"({search_term}) AND mediatype:(audio)",
+                "fl[]": ["identifier", "title", "creator"],
+                "sort[]": "downloads desc",
+                "rows": 4,
+                "page": 1,
+                "output": "json",
+            },
+            timeout=7,
+        )
+        if search_resp.status_code != 200:
+            return []
+
+        docs = search_resp.json().get("response", {}).get("docs", [])
+        for doc in docs:
+            identifier = doc.get("identifier")
+            if not identifier:
+                continue
+
+            meta_resp = requests.get(f"https://archive.org/metadata/{identifier}", timeout=6)
+            if meta_resp.status_code != 200:
+                continue
+
+            meta_json = meta_resp.json()
+            item_meta = meta_json.get("metadata") or {}
+            files = meta_json.get("files") or []
+
+            mp3_files = [
+                f for f in files
+                if str(f.get("name", "")).lower().endswith(".mp3")
+                and "_64kb" not in str(f.get("name", "")).lower()
+            ]
+            if not mp3_files:
+                continue
+
+            chosen = mp3_files[0]
+            fname = chosen["name"]
+            encoded_fname = urllib.parse.quote(fname)
+            direct_mp3_url = f"https://archive.org/download/{identifier}/{encoded_fname}"
+
+            raw_creator = doc.get("creator") or item_meta.get("creator") or "Internet Archive"
+            if isinstance(raw_creator, list):
+                raw_creator = ", ".join(str(c) for c in raw_creator[:2])
+
+            raw_title = chosen.get("title") or doc.get("title") or fname.rsplit(".", 1)[0]
+            if isinstance(raw_title, list):
+                raw_title = raw_title[0]
+
+            safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{raw_creator} - {raw_title}").strip() or "archive_track"
+            tracks.append({
+                "track_id": f"ia_{identifier}_{len(tracks)}",
+                "title": str(raw_title),
+                "artist": str(raw_creator),
+                "album": "Internet Archive Audio",
+                "artwork": f"https://archive.org/services/img/{identifier}",
+                "audio_url": direct_mp3_url,
+                "m4a_url": direct_mp3_url,
+                "mp3_filename": f"{safe_name}.mp3",
+                "is_preview": False,
+                "duration_str": _format_duration(chosen.get("length")),
+                "source_label": "Full Track (Internet Archive)",
+            })
+            if len(tracks) >= limit:
+                break
+    except Exception as e:
+        print(f"Internet Archive search notice: {e}")
+    return tracks
+
+
 def _search_itunes_preview_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Fallback lookup using Apple's iTunes Search API (30-second commercial previews)."""
+    """Tier 4: Fallback lookup using Apple's iTunes Search API (30-second commercial previews)."""
     resp = requests.get(
         "https://itunes.apple.com/search",
         params={"term": search_term, "media": "music", "entity": "song", "limit": limit * 2},
@@ -229,10 +316,11 @@ def search_songs_hybrid(
     local_media: Optional[List[Dict[str, Any]]] = None
 ) -> List[Dict[str, Any]]:
     """
-    3-Tier Song Discovery with Relevance Ranking & HTTP 404 Filtering:
+    4-Tier Song Discovery with Relevance Ranking & HTTP 404 Filtering:
     1) Local SQLite media_vault direct audio URLs.
     2) Audius Open Music API full-length tracks.
-    3) iTunes Search API 30-second previews (fallback when full track isn't on Audius).
+    3) Internet Archive (archive.org) full-length open/public-domain MP3s.
+    4) iTunes Search API 30-second previews (fallback when full open tracks aren't available).
     """
     primary_query, compact_query = extract_song_queries(query)
     if not primary_query:
@@ -274,12 +362,16 @@ def search_songs_hybrid(
                     "source_label": "Vault Full Track",
                 }])
 
-    # Tier 2: Audius full-length open catalog (primary + compact query)
+    # Tier 2: Audius full-length open catalog
     _add_unique(_search_audius_full_tracks(primary_query, limit=limit))
     if compact_query.lower() != primary_query.lower() and len(candidates) < limit:
         _add_unique(_search_audius_full_tracks(compact_query, limit=limit))
 
-    # Tier 3: iTunes 30-second commercial preview fallback
+    # Tier 3: Internet Archive full-length public domain / Creative Commons audio
+    if len(candidates) < limit:
+        _add_unique(_search_internet_archive_tracks(compact_query, limit=limit))
+
+    # Tier 4: iTunes 30-second commercial preview fallback
     try:
         _add_unique(_search_itunes_preview_tracks(primary_query, limit=limit))
         if compact_query.lower() != primary_query.lower():
@@ -292,7 +384,7 @@ def search_songs_hybrid(
 
     # Verify HTTP reachability on top candidates so 404 streams are filtered out
     verified: List[Dict[str, Any]] = []
-    for track in candidates[: limit + 3]:
+    for track in candidates[: limit + 4]:
         if _is_stream_reachable(track.get("audio_url", "")):
             verified.append(track)
         if len(verified) >= limit:
@@ -343,7 +435,7 @@ def convert_audio_url_to_mp3_bytes(
 
     mp3_bytes = _encode(bitrate)
     if max_bytes and len(mp3_bytes) > max_bytes:
-        mp3_bytes = _encode("112k")
+        mp3_bytes = _encode("96k")
     return mp3_bytes
 
 
