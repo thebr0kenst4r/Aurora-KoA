@@ -2,59 +2,38 @@
 ai_engine.py
 Encapsulates the thread-safe Gemini API client rotation pool, retry backoff,
 multi-turn conversation history builder (with strict user/model role alternation),
-4-tier full-length hybrid song lookup (Local Vault -> Audius -> Internet Archive -> iTunes 30s Fallback)
-with relevance scoring, HTTP 404 stream filtering, and in-memory FFmpeg .mp3 transcoding,
-4-method zero-quota web verification suite, trusted-domain verification,
-voice drafting for Discord broadcasts, and the Autonomous King of Avalon Update Scout.
+shared capability integration (MusicConduit & WebResearchSuite),
+trusted-domain verification, voice drafting for Discord broadcasts,
+and the Autonomous King of Avalon Update Scout.
 """
 
-import re
-import shutil
 import asyncio
 import threading
 import itertools
-import subprocess
-import urllib.parse
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional, Dict, Any
-import requests
 from google import genai
 from google.genai import types
 from tenacity import retry, wait_random_exponential, stop_after_attempt, retry_if_exception
-from ddgs import DDGS
-
-try:
-    import imageio_ffmpeg
-except ImportError:
-    imageio_ffmpeg = None
 
 from profiles import BotProfile, get_secret_or_env
 from database import DatabaseManager
+from capabilities import (
+    MusicConduit,
+    WebResearchSuite,
+    SEARCH_TRIGGERS,
+    AUDIO_OWNERSHIP_NOTICE,
+    is_song_request,
+    search_songs_hybrid,
+    convert_track_to_mp3_bytes,
+    convert_audio_url_to_mp3_bytes,
+    convert_m4a_url_to_mp3_bytes,
+    extract_and_convert_audio,
+)
 
-SEARCH_TRIGGERS = [
-    "search", "google", "look up", "lookup", "online", "latest news",
-    "patch notes", "recent update", "current event", "new hero", "meta", "verify"
-]
 REMEMBER_TRIGGERS = ["remember", "!remember", "recall our chat", "what did we discuss", "check memory"]
 INSULT_KEYWORDS = ["stupid", "idiot", "sucks", "trash", "loser", "liar", "hate", "fake", "bad", "scam", "useless"]
 SILENCE_TRIGGERS = ["be quiet", "shut up", "hush", "mute", "silence", "stop talking", "quiet"]
-
-SONG_EXPLICIT_TRIGGERS = [
-    "mp3", "m4a", "song", "music", "track", "audio", "album", "listen to", "download song", "sing"
-]
-GAME_NON_MUSIC_WORDS = [
-    "koa", "king of avalon", "kvk", "rally", "frost drake", "dragon", "troop", "march",
-    "fae", "sanctum", "alliance", "excalibur", "spire", "emblem", "hero", "golem"
-]
-
-AUDIO_OWNERSHIP_NOTICE = (
-    "\n\n---\n"
-    "*⚖️ Audio Notice: Streams and MP3 conversions are provided for personal listening of "
-    "public-domain, Creative Commons, or personally owned/licensed recordings. Please ensure you "
-    "own or hold valid rights to a track before downloading.*"
-)
-
-_CACHED_AUDIUS_HOSTS: List[str] = []
 
 
 def is_rate_limit_error(exception: BaseException) -> bool:
@@ -62,390 +41,10 @@ def is_rate_limit_error(exception: BaseException) -> bool:
     return "429" in err or "RESOURCE_EXHAUSTED" in err
 
 
-def is_song_request(text: str) -> bool:
-    """Detects whether the user is requesting a song/audio track without colliding with KoA terms."""
-    clean = text.lower().strip()
-    if any(g in clean for g in GAME_NON_MUSIC_WORDS) and not any(k in clean for k in ("mp3", "m4a", "song", "music", "track", "audio")):
-        return False
-    if any(k in clean for k in SONG_EXPLICIT_TRIGGERS):
-        return True
-    if re.match(r"^(play|download|find)\s+.+\s+by\s+.+", clean):
-        return True
-    return False
-
-
-def extract_song_queries(text: str) -> Tuple[str, str]:
-    """
-    Returns (primary_query, compact_query) with conversational filler and 'by' removed.
-    Example: 'Play Blue (Da Ba Dee) by Eiffel 65' -> ('Blue Da Ba Dee Eiffel 65', 'Blue Eiffel 65')
-    """
-    no_brackets = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", text)
-
-    def _clean(raw: str) -> str:
-        s = re.sub(
-            r"\b(hey|hi|hello|aurora|please|can you|could you|give me|get me|find|search|look up|lookup|download|direct|link|links|to|for|a|an|the|song|music|track|audio|mp3|m4a|file|files|like|mp3juice|play|listen|full|by|feat|ft|featuring|official|video|lyrics|radio|edit|version)\b",
-            " ",
-            raw,
-            flags=re.IGNORECASE,
-        )
-        s = re.sub(r"[^\w\s&'-]", " ", s)
-        return re.sub(r"\s+", " ", s).strip()
-
-    primary = _clean(text) or text.strip()
-    compact = _clean(no_brackets) or primary
-    return primary, compact
-
-
-def _format_duration(seconds: Any) -> str:
-    try:
-        if isinstance(seconds, str) and ":" in seconds:
-            return seconds.strip()
-        sec = int(float(seconds or 0))
-        if sec <= 0:
-            return ""
-        mins, rem = divmod(sec, 60)
-        return f"{mins}:{rem:02d}"
-    except Exception:
-        return ""
-
-
-def _get_audius_hosts() -> List[str]:
-    """Discovers healthy Audius discovery nodes with fallback to api.audius.co."""
-    global _CACHED_AUDIUS_HOSTS
-    if _CACHED_AUDIUS_HOSTS:
-        return _CACHED_AUDIUS_HOSTS
-    try:
-        r = requests.get("https://api.audius.co", timeout=4)
-        if r.status_code == 200:
-            hosts = [h.rstrip("/") for h in r.json().get("data", []) if isinstance(h, str)]
-            if hosts:
-                _CACHED_AUDIUS_HOSTS = hosts[:3]
-                return _CACHED_AUDIUS_HOSTS
-    except Exception:
-        pass
-    return ["https://api.audius.co"]
-
-
-def _is_stream_reachable(url: str) -> bool:
-    """Verifies that an audio URL responds with HTTP 200/206 so 404 links are never shown."""
-    if not url:
-        return False
-    try:
-        r = requests.head(url, allow_redirects=True, timeout=4)
-        if r.status_code in (200, 206):
-            return True
-        r_get = requests.get(url, headers={"Range": "bytes=0-1"}, stream=True, timeout=5)
-        r_get.close()
-        return r_get.status_code in (200, 206)
-    except Exception:
-        return False
-
-
-def _score_track_relevance(track: Dict[str, Any], query_tokens: List[str]) -> int:
-    """Ranks tracks higher when both requested artist and title words match, favoring full tracks."""
-    if not query_tokens:
-        return 0
-    haystack = f"{track.get('title', '')} {track.get('artist', '')}".lower()
-    matched = sum(1 for tok in query_tokens if tok in haystack)
-    bonus = 3 if not track.get("is_preview", True) else 0
-    return (matched * 10) + bonus
-
-
-def _search_audius_full_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Tier 2: Queries Audius Open Music API for full-length downloadable/streamable songs."""
-    for host in _get_audius_hosts():
-        try:
-            resp = requests.get(
-                f"{host}/v1/tracks/search",
-                params={"query": search_term, "app_name": "AuroraKoA"},
-                timeout=6,
-            )
-            if resp.status_code != 200:
-                continue
-
-            tracks: List[Dict[str, Any]] = []
-            for item in resp.json().get("data", []):
-                tid = item.get("id")
-                if not tid or item.get("is_streamable") is False:
-                    continue
-                title = item.get("title", "Unknown Title")
-                user_obj = item.get("user") or {}
-                artist = user_obj.get("name", "Unknown Artist")
-                artwork_obj = item.get("artwork") or {}
-                artwork_url = artwork_obj.get("150x150") or artwork_obj.get("480x480") or ""
-                duration_sec = item.get("duration", 0)
-                stream_url = f"{host}/v1/tracks/{tid}/stream?app_name=AuroraKoA"
-                safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip() or "aurora_track"
-
-                tracks.append({
-                    "track_id": f"audius_{tid}",
-                    "title": title,
-                    "artist": artist,
-                    "album": item.get("genre") or "Audius Open Stream",
-                    "artwork": artwork_url,
-                    "audio_url": stream_url,
-                    "m4a_url": stream_url,
-                    "mp3_filename": f"{safe_name}.mp3",
-                    "is_preview": False,
-                    "duration_str": _format_duration(duration_sec),
-                    "source_label": "Full Track (Audius)",
-                })
-                if len(tracks) >= limit * 2:
-                    break
-            if tracks:
-                return tracks
-        except Exception:
-            continue
-    return []
-
-
-def _search_internet_archive_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """
-    Tier 3: Queries the Internet Archive (archive.org) for full-length public-domain,
-    live recording, and Creative Commons .mp3 tracks with zero API keys.
-    """
-    tracks: List[Dict[str, Any]] = []
-    try:
-        search_resp = requests.get(
-            "https://archive.org/advancedsearch.php",
-            params={
-                "q": f"({search_term}) AND mediatype:(audio)",
-                "fl[]": ["identifier", "title", "creator"],
-                "sort[]": "downloads desc",
-                "rows": 4,
-                "page": 1,
-                "output": "json",
-            },
-            timeout=7,
-        )
-        if search_resp.status_code != 200:
-            return []
-
-        docs = search_resp.json().get("response", {}).get("docs", [])
-        for doc in docs:
-            identifier = doc.get("identifier")
-            if not identifier:
-                continue
-
-            meta_resp = requests.get(f"https://archive.org/metadata/{identifier}", timeout=6)
-            if meta_resp.status_code != 200:
-                continue
-
-            meta_json = meta_resp.json()
-            item_meta = meta_json.get("metadata") or {}
-            files = meta_json.get("files") or []
-
-            mp3_files = [
-                f for f in files
-                if str(f.get("name", "")).lower().endswith(".mp3")
-                and "_64kb" not in str(f.get("name", "")).lower()
-            ]
-            if not mp3_files:
-                continue
-
-            chosen = mp3_files[0]
-            fname = chosen["name"]
-            encoded_fname = urllib.parse.quote(fname)
-            direct_mp3_url = f"https://archive.org/download/{identifier}/{encoded_fname}"
-
-            raw_creator = doc.get("creator") or item_meta.get("creator") or "Internet Archive"
-            if isinstance(raw_creator, list):
-                raw_creator = ", ".join(str(c) for c in raw_creator[:2])
-
-            raw_title = chosen.get("title") or doc.get("title") or fname.rsplit(".", 1)[0]
-            if isinstance(raw_title, list):
-                raw_title = raw_title[0]
-
-            safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{raw_creator} - {raw_title}").strip() or "archive_track"
-            tracks.append({
-                "track_id": f"ia_{identifier}_{len(tracks)}",
-                "title": str(raw_title),
-                "artist": str(raw_creator),
-                "album": "Internet Archive Audio",
-                "artwork": f"https://archive.org/services/img/{identifier}",
-                "audio_url": direct_mp3_url,
-                "m4a_url": direct_mp3_url,
-                "mp3_filename": f"{safe_name}.mp3",
-                "is_preview": False,
-                "duration_str": _format_duration(chosen.get("length")),
-                "source_label": "Full Track (Internet Archive)",
-            })
-            if len(tracks) >= limit:
-                break
-    except Exception as e:
-        print(f"Internet Archive search notice: {e}")
-    return tracks
-
-
-def _search_itunes_preview_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Tier 4: Fallback lookup using Apple's iTunes Search API (30-second commercial previews)."""
-    resp = requests.get(
-        "https://itunes.apple.com/search",
-        params={"term": search_term, "media": "music", "entity": "song", "limit": limit * 2},
-        timeout=8,
-    )
-    resp.raise_for_status()
-
-    tracks: List[Dict[str, Any]] = []
-    for item in resp.json().get("results", []):
-        preview_url = item.get("previewUrl")
-        if not preview_url:
-            continue
-        artist = item.get("artistName", "Unknown Artist")
-        title = item.get("trackName", "Unknown Title")
-        safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip() or "aurora_preview"
-        tracks.append({
-            "track_id": f"itunes_{item.get('trackId', len(tracks))}",
-            "title": title,
-            "artist": artist,
-            "album": item.get("collectionName", ""),
-            "artwork": item.get("artworkUrl100", ""),
-            "audio_url": preview_url,
-            "m4a_url": preview_url,
-            "mp3_filename": f"{safe_name}.mp3",
-            "is_preview": True,
-            "duration_str": "0:30",
-            "source_label": "30s Preview",
-        })
-    return tracks
-
-
-def search_songs_hybrid(
-    query: str,
-    limit: int = 3,
-    local_media: Optional[List[Dict[str, Any]]] = None
-) -> List[Dict[str, Any]]:
-    """
-    4-Tier Song Discovery with Relevance Ranking & HTTP 404 Filtering:
-    1) Local SQLite media_vault direct audio URLs.
-    2) Audius Open Music API full-length tracks.
-    3) Internet Archive (archive.org) full-length open/public-domain MP3s.
-    4) iTunes Search API 30-second previews (fallback when full open tracks aren't available).
-    """
-    primary_query, compact_query = extract_song_queries(query)
-    if not primary_query:
-        return []
-
-    query_tokens = [w.lower() for w in re.findall(r"\w+", primary_query) if len(w) >= 2]
-    candidates: List[Dict[str, Any]] = []
-    seen_ids = set()
-
-    def _add_unique(items: List[Dict[str, Any]]) -> None:
-        for t in items:
-            tid = t.get("track_id")
-            if tid and tid not in seen_ids:
-                seen_ids.add(tid)
-                candidates.append(t)
-
-    # Tier 1: Local Media Vault direct audio URLs
-    if local_media:
-        term_lower = compact_query.lower()
-        for item in local_media:
-            url = str(item.get("url", ""))
-            title = str(item.get("title", ""))
-            desc = str(item.get("description", ""))
-            if any(ext in url.lower() for ext in (".mp3", ".m4a", ".wav", ".ogg")) and (
-                term_lower in title.lower() or term_lower in desc.lower()
-            ):
-                safe_name = re.sub(r'[\\/*?:"<>|]', "", title).strip() or "vault_track"
-                _add_unique([{
-                    "track_id": f"vault_{item.get('id', len(candidates))}",
-                    "title": title,
-                    "artist": item.get("added_by", "The Broken Star"),
-                    "album": item.get("category", "Vault Archive"),
-                    "artwork": "",
-                    "audio_url": url,
-                    "m4a_url": url,
-                    "mp3_filename": f"{safe_name}.mp3",
-                    "is_preview": False,
-                    "duration_str": "Full",
-                    "source_label": "Vault Full Track",
-                }])
-
-    # Tier 2: Audius full-length open catalog
-    _add_unique(_search_audius_full_tracks(primary_query, limit=limit))
-    if compact_query.lower() != primary_query.lower() and len(candidates) < limit:
-        _add_unique(_search_audius_full_tracks(compact_query, limit=limit))
-
-    # Tier 3: Internet Archive full-length public domain / Creative Commons audio
-    if len(candidates) < limit:
-        _add_unique(_search_internet_archive_tracks(compact_query, limit=limit))
-
-    # Tier 4: iTunes 30-second commercial preview fallback
-    try:
-        _add_unique(_search_itunes_preview_tracks(primary_query, limit=limit))
-        if compact_query.lower() != primary_query.lower():
-            _add_unique(_search_itunes_preview_tracks(compact_query, limit=limit))
-    except Exception as e:
-        print(f"iTunes fallback search notice: {e}")
-
-    # Sort by exact artist + title relevance first
-    candidates.sort(key=lambda t: _score_track_relevance(t, query_tokens), reverse=True)
-
-    # Verify HTTP reachability on top candidates so 404 streams are filtered out
-    verified: List[Dict[str, Any]] = []
-    for track in candidates[: limit + 4]:
-        if _is_stream_reachable(track.get("audio_url", "")):
-            verified.append(track)
-        if len(verified) >= limit:
-            break
-
-    return verified
-
-
-def convert_audio_url_to_mp3_bytes(
-    audio_url: str,
-    bitrate: str = "192k",
-    max_bytes: Optional[int] = None
-) -> bytes:
-    """
-    Downloads a full-length or preview audio stream and transcodes it in memory
-    into playable .mp3 bytes via bundled FFmpeg (imageio-ffmpeg).
-    """
-    audio_resp = requests.get(audio_url, allow_redirects=True, timeout=30)
-    audio_resp.raise_for_status()
-
-    ffmpeg_exe = None
-    if imageio_ffmpeg is not None:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    if not ffmpeg_exe:
-        ffmpeg_exe = shutil.which("ffmpeg")
-    if not ffmpeg_exe:
-        raise RuntimeError("FFmpeg binary not available. Ensure 'imageio-ffmpeg' is in requirements.txt.")
-
-    def _encode(target_bitrate: str) -> bytes:
-        cmd = [
-            ffmpeg_exe,
-            "-y",
-            "-i", "pipe:0",
-            "-vn",
-            "-acodec", "libmp3lame",
-            "-b:a", target_bitrate,
-            "-f", "mp3",
-            "pipe:1",
-        ]
-        proc = subprocess.run(
-            cmd,
-            input=audio_resp.content,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=True,
-        )
-        return proc.stdout
-
-    mp3_bytes = _encode(bitrate)
-    if max_bytes and len(mp3_bytes) > max_bytes:
-        mp3_bytes = _encode("96k")
-    return mp3_bytes
-
-
-convert_m4a_url_to_mp3_bytes = convert_audio_url_to_mp3_bytes
-
-
 class GeminiEngine:
     """
     Thread-safe AI Engine managing key rotation, multi-turn history formatting,
-    multi-source zero-quota web research, trusted domain verification,
+    shared capabilities (MusicConduit + WebResearchSuite), trusted domain verification,
     voice drafting, and autonomous King of Avalon update scouting.
     """
 
@@ -454,6 +53,8 @@ class GeminiEngine:
         self.db = db
         self.lock = threading.Lock()
         self.last_koa_scout_status: str = "Idle (Ready to scout)"
+        self.music = MusicConduit()
+        self.researcher = WebResearchSuite(mode_key=profile.mode_key)
 
         raw_keys = (
             get_secret_or_env("GEMINI_KEYS")
@@ -488,26 +89,24 @@ class GeminiEngine:
                     return True
         return False
 
-    # --- MULTI-TURN CONVERSATION HISTORY FORMATTER ---
-
     def build_conversation_contents(
         self,
         history_messages: Optional[List[Dict[str, Any]]],
         current_prompt: str,
         memory_context: str = "",
         max_turns: int = 14,
-        char_limit: int = 2400
+        char_limit: int = 2400,
     ) -> List[Dict[str, Any]]:
         contents: List[Dict[str, Any]] = []
 
         if memory_context:
             contents.append({
                 "role": "user",
-                "parts": [{"text": f"[Context & Memory Notes]\n{memory_context}"}]
+                "parts": [{"text": f"[Context & Memory Notes]\n{memory_context}"}],
             })
             contents.append({
                 "role": "model",
-                "parts": [{"text": "Understood. I have these records in mind."}]
+                "parts": [{"text": "Understood. I have these records in mind."}],
             })
 
         if history_messages:
@@ -533,7 +132,7 @@ class GeminiEngine:
                 if not contents and sdk_role == "model":
                     contents.append({
                         "role": "user",
-                        "parts": [{"text": "[Conversation Started]"}]
+                        "parts": [{"text": "[Conversation Started]"}],
                     })
 
                 if contents and contents[-1]["role"] == sdk_role:
@@ -541,7 +140,7 @@ class GeminiEngine:
                 else:
                     contents.append({
                         "role": sdk_role,
-                        "parts": [{"text": text}]
+                        "parts": [{"text": text}],
                     })
 
         if contents and contents[-1]["role"] == "user":
@@ -549,136 +148,22 @@ class GeminiEngine:
         else:
             contents.append({
                 "role": "user",
-                "parts": [{"text": current_prompt}]
+                "parts": [{"text": current_prompt}],
             })
 
         return contents
 
-    # --- ZERO-QUOTA MULTI-SOURCE RESEARCH SUITE ---
-
-    def search_ddg_text(self, query: str, max_results: int = 3) -> Tuple[List[str], List[str]]:
-        snippets, domains = [], []
-        try:
-            with DDGS() as ddgs:
-                for r in list(ddgs.text(query, max_results=max_results)):
-                    title = r.get("title", "")
-                    body = r.get("body", "")
-                    href = r.get("href", "")
-                    if body:
-                        snippets.append(f"[Web: {title}] {body} ({href})")
-                    if href and "/" in href:
-                        parts = href.split("/")
-                        if len(parts) > 2:
-                            domains.append(parts[2])
-        except Exception as e:
-            print(f"DDG text search notice: {e}")
-        return snippets, domains
-
-    def search_ddg_news(self, query: str, max_results: int = 2) -> Tuple[List[str], List[str]]:
-        snippets, domains = [], []
-        try:
-            with DDGS() as ddgs:
-                for r in list(ddgs.news(query, max_results=max_results)):
-                    title = r.get("title", "")
-                    body = r.get("body", "")
-                    url = r.get("url", "")
-                    date = r.get("date", "")
-                    if body:
-                        snippets.append(f"[News ({date}): {title}] {body} ({url})")
-                    if url and "/" in url:
-                        parts = url.split("/")
-                        if len(parts) > 2:
-                            domains.append(parts[2])
-        except Exception as e:
-            print(f"DDG news search notice: {e}")
-        return snippets, domains
-
-    def search_mediawiki(self, query: str) -> Tuple[List[str], List[str]]:
-        snippets, domains = [], []
-        endpoints = []
-        if self.profile.mode_key == "gaming":
-            endpoints.append(("kingofavalon.fandom.com", "https://kingofavalon.fandom.com/api.php"))
-        endpoints.append(("en.wikipedia.org", "https://en.wikipedia.org/w/api.php"))
-
-        headers = {"User-Agent": "AuroraStrategicBot/2.0 (Educational & Tactical Research)"}
-        for domain_label, api_url in endpoints:
-            try:
-                params = {
-                    "action": "query",
-                    "list": "search",
-                    "srsearch": query,
-                    "utf8": "1",
-                    "format": "json",
-                    "srlimit": 2
-                }
-                r = requests.get(api_url, params=params, headers=headers, timeout=6)
-                if r.status_code == 200:
-                    search_hits = r.json().get("query", {}).get("search", [])
-                    for hit in search_hits:
-                        title = hit.get("title", "")
-                        raw_snip = hit.get("snippet", "")
-                        clean_snip = (
-                            raw_snip.replace('<span class="searchmatch">', "")
-                            .replace("</span>", "")
-                            .replace("&quot;", '"')
-                        )
-                        if clean_snip:
-                            snippets.append(f"[Wiki ({domain_label}) - {title}]: {clean_snip}")
-                            domains.append(domain_label)
-            except Exception:
-                pass
-        return snippets, domains
-
-    def search_reddit_public(self, query: str) -> Tuple[List[str], List[str]]:
-        snippets, domains = [], []
-        headers = {"User-Agent": "AuroraStrategicBot/2.0"}
-        try:
-            encoded = urllib.parse.quote_plus(query)
-            if self.profile.mode_key == "gaming":
-                url = f"https://www.reddit.com/r/KingOfAvalon/search.json?q={encoded}&restrict_sr=1&sort=relevance&limit=2"
-            else:
-                url = f"https://www.reddit.com/search.json?q={encoded}&sort=relevance&limit=2"
-
-            r = requests.get(url, headers=headers, timeout=6)
-            if r.status_code == 200:
-                children = r.json().get("data", {}).get("children", [])
-                for child in children:
-                    post = child.get("data", {})
-                    title = post.get("title", "")
-                    selftext = (post.get("selftext", "") or "")[:280].replace("\n", " ")
-                    if title:
-                        snippets.append(f"[Community Thread: {title}] {selftext}")
-                        domains.append("reddit.com/r/kingofavalon" if self.profile.mode_key == "gaming" else "reddit.com")
-        except Exception:
-            pass
-        return snippets, domains
-
     def execute_multi_source_research(self, query: str) -> Tuple[str, List[str]]:
-        clean_q = query
-        for trig in ["search", "lookup", "look up", "google", "verify"]:
-            clean_q = clean_q.replace(trig, "")
-        clean_q = clean_q.strip() or query
+        self.researcher.mode_key = self.profile.mode_key
+        return self.researcher.execute_multi_source_research(query)
 
-        all_snippets: List[str] = []
-        all_domains: List[str] = []
-
-        s1, d1 = self.search_ddg_text(clean_q, max_results=3)
-        s2, d2 = self.search_ddg_news(clean_q, max_results=2)
-        s3, d3 = self.search_mediawiki(clean_q)
-        s4, d4 = self.search_reddit_public(clean_q)
-
-        all_snippets.extend(s1 + s2 + s3 + s4)
-        for d in (d1 + d2 + d3 + d4):
-            if d and d not in all_domains:
-                all_domains.append(d)
-
-        if not all_snippets:
-            return "", []
-
-        formatted = "[Live Verified Research Results]:\n" + "\n".join(all_snippets[:7])
-        return formatted, all_domains
-
-    def process_knowledge_ingestion(self, prompt: str, content: str, domains: List[str], is_sovereign_user: bool = False) -> Optional[str]:
+    def process_knowledge_ingestion(
+        self,
+        prompt: str,
+        content: str,
+        domains: List[str],
+        is_sovereign_user: bool = False,
+    ) -> Optional[str]:
         if not self.profile.enable_auto_learn and not is_sovereign_user:
             return None
 
@@ -693,7 +178,7 @@ class GeminiEngine:
                 content=content,
                 verified_by=f"{self.profile.creator_name} (Direct Sovereign Authority)",
                 category="Sovereign Strategy",
-                access_tier="Everyone"
+                access_tier="Everyone",
             )
             return topic_key
 
@@ -711,13 +196,11 @@ class GeminiEngine:
                 content=content[:650],
                 verified_by=verifier_label,
                 category="Web Verified",
-                access_tier="Everyone"
+                access_tier="Everyone",
             )
             return topic_snippet
 
         return None
-
-    # --- AUTONOMOUS KING OF AVALON UPDATE SCOUT ---
 
     def run_koa_auto_scout(self, custom_topic: str = "") -> Tuple[bool, str]:
         if not self.profile.enable_auto_scout and not custom_topic:
@@ -734,7 +217,7 @@ class GeminiEngine:
             else [
                 f"King of Avalon latest patch notes update {current_year}",
                 f"King of Avalon new generation heroes tier list {current_year}",
-                f"King of Avalon Fae season mechanics sanctum strategy"
+                "King of Avalon Fae season mechanics sanctum strategy",
             ]
         )
 
@@ -755,7 +238,7 @@ class GeminiEngine:
                 resp = client.models.generate_content(
                     model="gemini-3.5-flash-lite",
                     contents=synthesis_prompt,
-                    config=types.GenerateContentConfig(temperature=0.25)
+                    config=types.GenerateContentConfig(temperature=0.25),
                 )
                 summary_text = (resp.text or "").strip()
                 if summary_text:
@@ -767,7 +250,7 @@ class GeminiEngine:
                         content=summary_text,
                         verified_by=f"Aurora Auto-Scout ({len(domains)} Sources: {', '.join(domains[:2])})",
                         category="Auto-Scout Updates",
-                        access_tier="Everyone"
+                        access_tier="Everyone",
                     )
                     ingested_topics.append(title_clean)
             except Exception as e:
@@ -783,8 +266,6 @@ class GeminiEngine:
             self.last_koa_scout_status = msg
             return False, msg
 
-    # --- VOICE DRAFTER FOR DISCORD BROADCASTER ---
-
     def draft_in_bot_voice(self, raw_announcement: str) -> str:
         if not raw_announcement.strip():
             return ""
@@ -795,13 +276,11 @@ class GeminiEngine:
         )
         return self.call_gemini_sync(prompt)
 
-    # --- GEMINI GENERATION & BACKGROUND SUMMARIZER ---
-
     @retry(
         wait=wait_random_exponential(multiplier=1, max=15),
         stop=stop_after_attempt(4),
         retry=retry_if_exception(is_rate_limit_error),
-        reraise=True
+        reraise=True,
     )
     async def call_gemini_async(self, contents: List[Dict[str, Any]]) -> Any:
         active_client = self.get_next_client()
@@ -810,20 +289,20 @@ class GeminiEngine:
 
         config = types.GenerateContentConfig(
             system_instruction=self.profile.build_effective_system_prompt(),
-            temperature=0.7
+            temperature=0.7,
         )
         try:
             return await active_client.aio.models.generate_content(
                 model="gemini-3.5-flash-lite",
                 contents=contents,
-                config=config
+                config=config,
             )
         except Exception as e:
             if is_rate_limit_error(e):
                 return await active_client.aio.models.generate_content(
                     model="gemini-3.1-flash-lite",
                     contents=contents,
-                    config=config
+                    config=config,
                 )
             raise e
 
@@ -831,7 +310,7 @@ class GeminiEngine:
         self,
         prompt_payload: str,
         history_messages: Optional[List[Dict[str, Any]]] = None,
-        memory_context: str = ""
+        memory_context: str = "",
     ) -> str:
         active_client = self.get_next_client()
         if not active_client:
@@ -839,18 +318,18 @@ class GeminiEngine:
 
         config = types.GenerateContentConfig(
             system_instruction=self.profile.build_effective_system_prompt(),
-            temperature=0.7
+            temperature=0.7,
         )
         contents = self.build_conversation_contents(
             history_messages=history_messages,
             current_prompt=prompt_payload,
-            memory_context=memory_context
+            memory_context=memory_context,
         )
         try:
             resp = active_client.models.generate_content(
                 model="gemini-3.5-flash-lite",
                 contents=contents,
-                config=config
+                config=config,
             )
             return resp.text or "The celestial threads waver... no response was formed."
         except Exception as e:
@@ -859,7 +338,7 @@ class GeminiEngine:
                     resp2 = active_client.models.generate_content(
                         model="gemini-3.1-flash-lite",
                         contents=contents,
-                        config=config
+                        config=config,
                     )
                     return resp2.text or "No response formed."
                 except Exception as e2:
@@ -888,7 +367,7 @@ class GeminiEngine:
                 res = await active_client.aio.models.generate_content(
                     model="gemini-3.5-flash-lite",
                     contents=summary_prompt,
-                    config=types.GenerateContentConfig(temperature=0.2)
+                    config=types.GenerateContentConfig(temperature=0.2),
                 )
                 if res.text:
                     self.db.update_rolling_summary(str(user_id), res.text.strip())

@@ -1,25 +1,26 @@
 """
 profiles.py
-Master Mode Registry & Base Profile Class.
-Links each APP_MODE option ('gaming', 'realtor', etc.) to its dedicated Python module
-(e.g., mode_gaming.py, mode_realtor.py).
-Provides fallback-safe override layering so any string, persona description, trusted source,
-or feature flag can be customized in the Admin Panel and stored in SQLite, while instantly
-reverting to the hardcoded Python file defaults if reset or if an issue arises.
+Master Mode Registry, Base Profile Class & Global Site-Wide Mode Persistence.
+Links each APP_MODE option ('gaming', 'realtor', etc.) to its dedicated mode package
+under modes/<mode_key>/ (e.g., modes/gaming/profile.py, modes/realtor/profile.py).
+Stores the active site mode globally via @st.cache_resource + site_state.json +
+GitHub 'db-vault' sync so switching modes with the Sovereign Key updates the
+active mode for ALL visitors on that deployment and persists across reboots.
 """
 
 import os
+import json
 import copy
 import importlib
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Any, Optional
+from typing import List, Dict, Tuple, Any, Optional, Callable
 import streamlit as st
 
-# Master Registry mapping mode keys to their dedicated Python module & class name
-MODE_REGISTRY: Dict[str, Tuple[str, str]] = {
-    "gaming": ("mode_gaming", "GamingProfile"),
-    "realtor": ("mode_realtor", "RealtorProfile"),
-}
+from modes import MODE_PACKAGE_REGISTRY
+
+SITE_STATE_FILE = "site_state.json"
+CUSTOM_MODES_FILE = "custom_modes.json"
 
 
 def get_secret_or_env(key: str, default: str = "") -> str:
@@ -35,11 +36,56 @@ def get_secret_or_env(key: str, default: str = "") -> str:
     return default
 
 
+def get_deployment_namespace() -> str:
+    """
+    Identifies this deployment instance on GitHub db-vault so a Gaming site and a Realtor site
+    can share the same GitHub repository without overwriting each other's active site mode.
+    """
+    explicit_id = get_secret_or_env("SITE_ID", "")
+    if explicit_id:
+        return explicit_id.lower().strip().replace(" ", "_")
+    base_secret_mode = get_secret_or_env("APP_MODE", "gaming").lower().strip()
+    return base_secret_mode if base_secret_mode else "gaming"
+
+
+@st.cache_resource
+def _get_global_site_state_holder() -> Dict[str, Any]:
+    """
+    Process-wide singleton shared across ALL browser sessions on this Streamlit deployment.
+    """
+    default_mode = get_secret_or_env("APP_MODE", "gaming").lower().strip() or "gaming"
+    active_mode = default_mode
+
+    if os.path.exists(SITE_STATE_FILE):
+        try:
+            with open(SITE_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict) and data.get("active_mode"):
+                    active_mode = str(data["active_mode"]).lower().strip()
+        except Exception as e:
+            print(f"[Global Mode State Notice] Could not read {SITE_STATE_FILE}: {e}")
+
+    custom_modes: List[str] = []
+    if os.path.exists(CUSTOM_MODES_FILE):
+        try:
+            with open(CUSTOM_MODES_FILE, "r", encoding="utf-8") as f:
+                cdata = json.load(f)
+                if isinstance(cdata, list):
+                    custom_modes = [str(m).lower().strip() for m in cdata if str(m).strip()]
+        except Exception:
+            pass
+
+    return {
+        "active_mode": active_mode,
+        "custom_modes": custom_modes,
+    }
+
+
 @dataclass
 class BotProfile:
     """
     Base configuration class for all deployment modes.
-    Subclasses in mode_gaming.py and mode_realtor.py define the authoritative Python defaults.
+    Subclasses in modes/gaming/profile.py and modes/realtor/profile.py define the Python defaults.
     """
     mode_key: str = "base"
     page_title: str = "Aurora — The Broken Star"
@@ -56,19 +102,16 @@ class BotProfile:
     banner_html: str = ""
     welcome_message: str = "I am Aurora. The celestial resonance chamber is open. How may I assist your campaign?"
 
-    # How the bot sees itself, talks, and relates to its Creator (Editable in Mode File & Admin Panel)
     self_identity_description: str = ""
     creator_relationship_instruction: str = ""
     system_instruction: str = ""
     about_creator_markdown: str = ""
 
-    # Trusted Web Domains (Requires only 1 match from these domains for instant verification)
     trusted_domains: List[str] = field(default_factory=list)
     access_tiers: List[str] = field(
         default_factory=lambda: ["Everyone", "Alliance Only", "Sovereign Only", "Draft"]
     )
 
-    # Feature & Automation Toggles (Defined in mode Python file, overridable in Admin Panel)
     enable_discord: bool = True
     enable_discord_voice: bool = True
     enable_auto_learn: bool = True
@@ -78,21 +121,18 @@ class BotProfile:
     enable_keep_alive_ping: bool = True
     backup_interval_hours: float = 3.0
     app_public_url: str = "https://aurora-koa.streamlit.app"
-    calculator_type: str = "gaming_march"  # "gaming_march" or "realtor_mortgage"
+    calculator_type: str = "gaming_march"
+    calculator_renderer: Optional[Callable[[], None]] = field(default=None, repr=False)
 
-    # Displayed UI Strings Dictionary (Every title, subtitle, button, and input box on the site)
     ui_strings: Dict[str, str] = field(default_factory=dict)
 
-    # Initial SQLite Seed Data
     seed_docs: List[Tuple[str, str, str, str, str, str]] = field(default_factory=list)
     seed_jokes: List[str] = field(default_factory=list)
     seed_media: List[Tuple[str, str, str, str]] = field(default_factory=list)
 
-    # Internal Snapshot of Python File Defaults for Instant Safe Fallback
     _python_defaults: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def snapshot_python_defaults(self) -> None:
-        """Records the pristine Python file defaults before any database overrides are applied."""
         self._python_defaults = {
             "page_title": self.page_title,
             "page_icon": self.page_icon,
@@ -123,23 +163,17 @@ class BotProfile:
         }
 
     def revert_to_python_defaults(self) -> None:
-        """Restores all attributes and UI strings to the original values in the mode Python file."""
         if not self._python_defaults:
             return
         for k, v in self._python_defaults.items():
             setattr(self, k, copy.deepcopy(v))
 
     def get_python_default(self, attr_or_str_key: str) -> Any:
-        """Returns the original hardcoded Python file value for any attribute or UI string key."""
         if attr_or_str_key in self._python_defaults:
             return self._python_defaults[attr_or_str_key]
         return self._python_defaults.get("ui_strings", {}).get(attr_or_str_key, "")
 
     def apply_overrides(self, overrides: Dict[str, Any]) -> None:
-        """
-        Safely applies database-stored admin overrides on top of the Python file defaults.
-        If any field is malformed, empty, or raises an error, falls back to the Python default.
-        """
         if not overrides or not isinstance(overrides, dict):
             return
         try:
@@ -151,13 +185,13 @@ class BotProfile:
                 "about_creator_markdown", "enable_discord", "enable_discord_voice",
                 "enable_auto_learn", "enable_auto_scout", "enable_calculator",
                 "enable_lore_vault", "enable_keep_alive_ping", "backup_interval_hours",
-                "app_public_url", "calculator_type"
+                "app_public_url", "calculator_type",
             ]
             for attr in scalar_attrs:
                 if attr in overrides and overrides[attr] is not None:
                     val = overrides[attr]
                     if isinstance(val, str) and val.strip() == "":
-                        continue  # Empty string falls back to Python default
+                        continue
                     setattr(self, attr, val)
 
             if "trusted_domains" in overrides and isinstance(overrides["trusted_domains"], list):
@@ -179,10 +213,6 @@ class BotProfile:
             self.revert_to_python_defaults()
 
     def get_str(self, key: str, fallback: str = "") -> str:
-        """
-        Central string accessor used by all UI components.
-        Checks active (possibly overridden) ui_strings first, then Python file defaults, then fallback.
-        """
         val = self.ui_strings.get(key, "")
         if val and str(val).strip():
             return str(val)
@@ -191,8 +221,18 @@ class BotProfile:
             return str(default_val)
         return fallback
 
+    def render_calculator(self) -> None:
+        """Invokes the modular calculator attached to this mode."""
+        if callable(self.calculator_renderer):
+            self.calculator_renderer()
+        elif self.calculator_type == "realtor_mortgage":
+            from modes.realtor.payment_calculator import render_realtor_payment_calculator
+            render_realtor_payment_calculator()
+        else:
+            from modes.gaming.march_calculator import render_gaming_march_calculator
+            render_gaming_march_calculator()
+
     def build_effective_system_prompt(self) -> str:
-        """Combines self-identity, core system instructions, and creator relationship rules."""
         sections = []
         if self.self_identity_description.strip():
             sections.append(f"[Self-Identity & Voice]:\n{self.self_identity_description.strip()}")
@@ -203,13 +243,12 @@ class BotProfile:
         return "\n\n".join(sections)
 
     def render_dynamic_banner(self) -> str:
-        """Renders the top HTML banner using the current customizable header_title, subtitle, and gateway text."""
         if self.banner_html and "{header_title}" in self.banner_html:
             try:
                 return self.banner_html.format(
                     header_title=self.header_title,
                     header_subtitle=self.header_subtitle,
-                    gateway_status_text=self.gateway_status_text
+                    gateway_status_text=self.gateway_status_text,
                 )
             except Exception:
                 pass
@@ -218,48 +257,95 @@ class BotProfile:
 
 class DomainConfig:
     """
-    Central Mode Factory & Router.
-    Loads the dedicated Python file for the active mode (e.g., mode_gaming.py or mode_realtor.py)
-    and merges any active SQLite overrides.
+    Central Mode Factory & Global Site-Wide Mode Router.
+    Loads the dedicated mode subpackage under modes/<mode_key>/ and manages
+    site-wide persistent mode switching for all users.
     """
 
     @classmethod
     def get_available_modes(cls, custom_modes_from_db: Optional[List[str]] = None) -> List[str]:
-        modes = list(MODE_REGISTRY.keys())
+        holder = _get_global_site_state_holder()
+        modes = list(MODE_PACKAGE_REGISTRY.keys())
+        for m in holder.get("custom_modes", []):
+            if m and m not in modes:
+                modes.append(m)
         if custom_modes_from_db:
             for m in custom_modes_from_db:
-                if m not in modes:
+                if m and m not in modes:
                     modes.append(m)
         return modes
 
     @classmethod
+    def register_custom_mode(cls, mode_slug: str, db: Any = None) -> None:
+        clean_slug = mode_slug.lower().strip().replace(" ", "_")
+        if not clean_slug:
+            return
+        holder = _get_global_site_state_holder()
+        if clean_slug not in holder["custom_modes"] and clean_slug not in MODE_PACKAGE_REGISTRY:
+            holder["custom_modes"].append(clean_slug)
+        try:
+            with open(CUSTOM_MODES_FILE, "w", encoding="utf-8") as f:
+                json.dump(holder["custom_modes"], f, indent=2)
+            if db is not None and hasattr(db, "sync_json_file_to_vault"):
+                db.sync_json_file_to_vault(CUSTOM_MODES_FILE, f"backups/{CUSTOM_MODES_FILE}", f"Registered custom mode {clean_slug}")
+        except Exception as e:
+            print(f"[Custom Mode Registry Notice]: {e}")
+
+    @classmethod
     def get_active_mode_key(cls) -> str:
-        if "session_app_mode_override" in st.session_state and st.session_state.session_app_mode_override:
-            return str(st.session_state.session_app_mode_override).lower().strip()
-        secret_mode = get_secret_or_env("APP_MODE", "gaming").lower().strip()
-        return secret_mode if secret_mode else "gaming"
+        """Returns the active mode for the ENTIRE deployment site (shared across all visitors)."""
+        holder = _get_global_site_state_holder()
+        return holder["active_mode"]
+
+    @classmethod
+    def set_active_mode_key(cls, new_mode: str, db: Any = None) -> str:
+        """
+        Persistently switches the active mode for ALL visitors on this site,
+        writes site_state.json locally, and syncs it to GitHub db-vault.
+        """
+        clean_mode = new_mode.lower().strip().replace(" ", "_")
+        if not clean_mode:
+            return cls.get_active_mode_key()
+
+        holder = _get_global_site_state_holder()
+        holder["active_mode"] = clean_mode
+
+        payload = {
+            "active_mode": clean_mode,
+            "deployment_namespace": get_deployment_namespace(),
+            "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
+        try:
+            with open(SITE_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            if db is not None and hasattr(db, "sync_json_file_to_vault"):
+                ns = get_deployment_namespace()
+                db.sync_json_file_to_vault(
+                    SITE_STATE_FILE,
+                    f"backups/site_state_{ns}.json",
+                    f"Switched deployment [{ns}] mode globally to '{clean_mode}'",
+                )
+        except Exception as e:
+            print(f"[Global Mode Persist Notice]: {e}")
+
+        return clean_mode
 
     @classmethod
     def load_base_profile_from_python_file(cls, mode_key: str = "") -> BotProfile:
-        """
-        Imports the dedicated Python file for the given mode_key and instantiates its Profile class,
-        recording a pristine snapshot of its Python file defaults.
-        """
         target_mode = (mode_key or cls.get_active_mode_key()).lower().strip()
 
-        if target_mode in MODE_REGISTRY:
-            module_name, class_name = MODE_REGISTRY[target_mode]
+        if target_mode in MODE_PACKAGE_REGISTRY:
+            module_name, class_name = MODE_PACKAGE_REGISTRY[target_mode]
             try:
                 mod = importlib.import_module(module_name)
                 prof_cls = getattr(mod, class_name)
                 profile: BotProfile = prof_cls()
             except Exception as e:
                 print(f"Error importing {module_name}.{class_name}: {e}")
-                from mode_gaming import GamingProfile
+                from modes.gaming.profile import GamingProfile
                 profile = GamingProfile()
         else:
-            # Custom mode created in Admin Panel inherits GamingProfile structure with its own DB file
-            from mode_gaming import GamingProfile
+            from modes.gaming.profile import GamingProfile
             profile = GamingProfile()
             profile.mode_key = target_mode
             profile.db_filename = f"{target_mode}_core.db"
@@ -273,7 +359,6 @@ class DomainConfig:
 
     @classmethod
     def load_profile(cls, mode_key: str = "", db: Any = None) -> BotProfile:
-        """Loads the Python file profile and applies any saved SQLite overrides if db is provided."""
         profile = cls.load_base_profile_from_python_file(mode_key)
         if db is not None and hasattr(db, "get_mode_override"):
             overrides = db.get_mode_override(profile.mode_key)
