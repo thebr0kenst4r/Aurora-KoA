@@ -2,11 +2,10 @@
 ai_engine.py
 Encapsulates the thread-safe Gemini API client rotation pool, retry backoff,
 multi-turn conversation history builder (with strict user/model role alternation),
-hybrid song lookup (iTunes Search API) & in-memory .m4a -> .mp3 FFmpeg transcoder,
-background rolling summarization, 4-method zero-quota web verification suite
-(DuckDuckGo Text, DuckDuckGo News, MediaWiki/Fandom API, Reddit JSON),
-trusted-domain verification, voice drafting for Discord broadcasts,
-and the Autonomous King of Avalon Update Scout.
+full-length hybrid song lookup (Local Vault -> Audius Full Tracks -> iTunes 30s Fallback)
+& in-memory FFmpeg .mp3 transcoder, background rolling summarization,
+4-method zero-quota web verification suite, trusted-domain verification,
+voice drafting for Discord broadcasts, and the Autonomous King of Avalon Update Scout.
 """
 
 import re
@@ -48,6 +47,8 @@ GAME_NON_MUSIC_WORDS = [
     "fae", "sanctum", "alliance", "excalibur", "spire", "emblem", "hero", "golem"
 ]
 
+_CACHED_AUDIUS_HOST: Optional[str] = None
+
 
 def is_rate_limit_error(exception: BaseException) -> bool:
     err = str(exception)
@@ -67,9 +68,9 @@ def is_song_request(text: str) -> bool:
 
 
 def extract_song_query(text: str) -> str:
-    """Strips conversational filler so iTunes Search receives a clean artist/song title."""
+    """Strips conversational filler so audio search APIs receive a clean artist/song title."""
     cleaned = re.sub(
-        r"\b(hey|hi|hello|aurora|please|can you|could you|give me|get me|find|search|look up|lookup|download|direct|link|links|to|for|a|an|the|song|music|track|audio|mp3|m4a|file|files|like|mp3juice|play|listen)\b",
+        r"\b(hey|hi|hello|aurora|please|can you|could you|give me|get me|find|search|look up|lookup|download|direct|link|links|to|for|a|an|the|song|music|track|audio|mp3|m4a|file|files|like|mp3juice|play|listen|full)\b",
         " ",
         text,
         flags=re.IGNORECASE,
@@ -79,15 +80,78 @@ def extract_song_query(text: str) -> str:
     return cleaned if len(cleaned) >= 2 else text.strip()
 
 
-def search_songs_hybrid(query: str, limit: int = 3) -> List[Dict[str, str]]:
-    """
-    Queries the free, keyless iTunes Search API for real song metadata
-    and direct downloadable .m4a audio URLs (previewUrl).
-    """
-    search_term = extract_song_query(query)
-    if not search_term:
-        return []
+def _format_duration(seconds: Any) -> str:
+    try:
+        sec = int(seconds or 0)
+        if sec <= 0:
+            return ""
+        mins, rem = divmod(sec, 60)
+        return f"{mins}:{rem:02d}"
+    except Exception:
+        return ""
 
+
+def _get_audius_host() -> str:
+    """Discovers a healthy Audius discovery node with instant fallback to api.audius.co."""
+    global _CACHED_AUDIUS_HOST
+    if _CACHED_AUDIUS_HOST:
+        return _CACHED_AUDIUS_HOST
+    try:
+        r = requests.get("https://api.audius.co", timeout=4)
+        if r.status_code == 200:
+            hosts = r.json().get("data", [])
+            if hosts and isinstance(hosts[0], str):
+                _CACHED_AUDIUS_HOST = hosts[0].rstrip("/")
+                return _CACHED_AUDIUS_HOST
+    except Exception:
+        pass
+    return "https://api.audius.co"
+
+
+def _search_audius_full_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """Queries Audius Open Music API for full-length downloadable/streamable songs."""
+    host = _get_audius_host()
+    resp = requests.get(
+        f"{host}/v1/tracks/search",
+        params={"query": search_term, "app_name": "AuroraKoA"},
+        timeout=8,
+    )
+    resp.raise_for_status()
+
+    tracks: List[Dict[str, Any]] = []
+    for item in resp.json().get("data", []):
+        tid = item.get("id")
+        if not tid or item.get("is_streamable") is False:
+            continue
+        title = item.get("title", "Unknown Title")
+        user_obj = item.get("user") or {}
+        artist = user_obj.get("name", "Unknown Artist")
+        artwork_obj = item.get("artwork") or {}
+        artwork_url = artwork_obj.get("150x150") or artwork_obj.get("480x480") or ""
+        duration_sec = item.get("duration", 0)
+        stream_url = f"{host}/v1/tracks/{tid}/stream?app_name=AuroraKoA"
+        safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip() or "aurora_track"
+
+        tracks.append({
+            "track_id": f"audius_{tid}",
+            "title": title,
+            "artist": artist,
+            "album": item.get("genre") or "Full Track Stream",
+            "artwork": artwork_url,
+            "audio_url": stream_url,
+            "m4a_url": stream_url,
+            "mp3_filename": f"{safe_name}.mp3",
+            "is_preview": False,
+            "duration_str": _format_duration(duration_sec),
+            "source_label": "Full Track",
+        })
+        if len(tracks) >= limit:
+            break
+    return tracks
+
+
+def _search_itunes_preview_tracks(search_term: str, limit: int = 3) -> List[Dict[str, Any]]:
+    """Fallback lookup using Apple's iTunes Search API (provides 30-second commercial previews)."""
     resp = requests.get(
         "https://itunes.apple.com/search",
         params={"term": search_term, "media": "music", "entity": "song", "limit": limit},
@@ -95,33 +159,102 @@ def search_songs_hybrid(query: str, limit: int = 3) -> List[Dict[str, str]]:
     )
     resp.raise_for_status()
 
-    tracks: List[Dict[str, str]] = []
+    tracks: List[Dict[str, Any]] = []
     for item in resp.json().get("results", []):
-        m4a_url = item.get("previewUrl")
-        if not m4a_url:
+        preview_url = item.get("previewUrl")
+        if not preview_url:
             continue
         artist = item.get("artistName", "Unknown Artist")
         title = item.get("trackName", "Unknown Title")
-        safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip() or "aurora_track"
+        safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{artist} - {title}").strip() or "aurora_preview"
         tracks.append({
-            "track_id": str(item.get("trackId", len(tracks))),
+            "track_id": f"itunes_{item.get('trackId', len(tracks))}",
             "title": title,
             "artist": artist,
             "album": item.get("collectionName", ""),
             "artwork": item.get("artworkUrl100", ""),
-            "m4a_url": m4a_url,
-            "store_url": item.get("trackViewUrl", ""),
+            "audio_url": preview_url,
+            "m4a_url": preview_url,
             "mp3_filename": f"{safe_name}.mp3",
+            "is_preview": True,
+            "duration_str": "0:30",
+            "source_label": "30s Preview",
         })
     return tracks
 
 
-def convert_m4a_url_to_mp3_bytes(m4a_url: str, bitrate: str = "192k") -> bytes:
+def search_songs_hybrid(
+    query: str,
+    limit: int = 3,
+    local_media: Optional[List[Dict[str, Any]]] = None
+) -> List[Dict[str, Any]]:
     """
-    Downloads a direct .m4a audio stream and transcodes it in memory
+    3-Tier Song Discovery:
+    1) Checks local SQLite media_vault for direct full-length audio URLs.
+    2) Searches Audius Open Music API for full-length tracks (no 30s limit).
+    3) Falls back to iTunes Search API (30s preview) if fewer than `limit` full tracks match.
+    """
+    search_term = extract_song_query(query)
+    if not search_term:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    term_lower = search_term.lower()
+
+    # Tier 1: Local Media Vault direct audio URLs
+    if local_media:
+        for item in local_media:
+            url = str(item.get("url", ""))
+            title = str(item.get("title", ""))
+            desc = str(item.get("description", ""))
+            if any(ext in url.lower() for ext in (".mp3", ".m4a", ".wav", ".ogg")) and (
+                term_lower in title.lower() or term_lower in desc.lower()
+            ):
+                safe_name = re.sub(r'[\\/*?:"<>|]', "", title).strip() or "vault_track"
+                results.append({
+                    "track_id": f"vault_{item.get('id', len(results))}",
+                    "title": title,
+                    "artist": item.get("added_by", "The Broken Star"),
+                    "album": item.get("category", "Vault Archive"),
+                    "artwork": "",
+                    "audio_url": url,
+                    "m4a_url": url,
+                    "mp3_filename": f"{safe_name}.mp3",
+                    "is_preview": False,
+                    "duration_str": "Full",
+                    "source_label": "Vault Full Track",
+                })
+
+    # Tier 2: Audius full-length open catalog
+    if len(results) < limit:
+        try:
+            audius_hits = _search_audius_full_tracks(search_term, limit=limit - len(results))
+            results.extend(audius_hits)
+        except Exception as e:
+            print(f"Audius search notice: {e}")
+
+    # Tier 3: iTunes 30-second commercial preview fallback
+    if len(results) < limit:
+        try:
+            itunes_hits = _search_itunes_preview_tracks(search_term, limit=limit - len(results))
+            results.extend(itunes_hits)
+        except Exception as e:
+            print(f"iTunes fallback search notice: {e}")
+
+    return results[:limit]
+
+
+def convert_audio_url_to_mp3_bytes(
+    audio_url: str,
+    bitrate: str = "192k",
+    max_bytes: Optional[int] = None
+) -> bytes:
+    """
+    Downloads a full-length or preview audio stream and transcodes it in memory
     into playable .mp3 bytes via bundled FFmpeg (imageio-ffmpeg).
+    If max_bytes is set (e.g., for Discord upload caps), re-encodes at 112k if needed.
     """
-    audio_resp = requests.get(m4a_url, timeout=15)
+    audio_resp = requests.get(audio_url, timeout=30)
     audio_resp.raise_for_status()
 
     ffmpeg_exe = None
@@ -132,24 +265,34 @@ def convert_m4a_url_to_mp3_bytes(m4a_url: str, bitrate: str = "192k") -> bytes:
     if not ffmpeg_exe:
         raise RuntimeError("FFmpeg binary not available. Ensure 'imageio-ffmpeg' is in requirements.txt.")
 
-    cmd = [
-        ffmpeg_exe,
-        "-y",
-        "-i", "pipe:0",
-        "-vn",
-        "-acodec", "libmp3lame",
-        "-b:a", bitrate,
-        "-f", "mp3",
-        "pipe:1",
-    ]
-    proc = subprocess.run(
-        cmd,
-        input=audio_resp.content,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=True,
-    )
-    return proc.stdout
+    def _encode(target_bitrate: str) -> bytes:
+        cmd = [
+            ffmpeg_exe,
+            "-y",
+            "-i", "pipe:0",
+            "-vn",
+            "-acodec", "libmp3lame",
+            "-b:a", target_bitrate,
+            "-f", "mp3",
+            "pipe:1",
+        ]
+        proc = subprocess.run(
+            cmd,
+            input=audio_resp.content,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        return proc.stdout
+
+    mp3_bytes = _encode(bitrate)
+    if max_bytes and len(mp3_bytes) > max_bytes:
+        mp3_bytes = _encode("112k")
+    return mp3_bytes
+
+
+# Backward-compatible alias
+convert_m4a_url_to_mp3_bytes = convert_audio_url_to_mp3_bytes
 
 
 class GeminiEngine:
@@ -246,7 +389,6 @@ class GeminiEngine:
                 if len(text) > char_limit:
                     text = text[:char_limit] + "..."
 
-                # Gemini expects the first turn to be 'user'
                 if not contents and sdk_role == "model":
                     contents.append({
                         "role": "user",
