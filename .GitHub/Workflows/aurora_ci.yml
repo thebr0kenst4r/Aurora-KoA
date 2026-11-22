@@ -1,1 +1,53 @@
-test
+name: Aurora Self-Upgrade CI/CD Validation
+
+on:
+  push:
+    branches:
+      - "main"
+      - "aurora-upgrade/**"
+  pull_request:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+jobs:
+  validate-modules:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile & Syntax Check All Python Modules
+        run: |
+          python -m compileall -q .
+
+      - name: Verify Core Capabilities & Mode Imports
+        run: |
+          python -c "
+          import importlib
+          import profiles
+          import database
+          import ai_engine
+          import capabilities
+          from capabilities.r2_storage import CloudflareR2Manager
+          from capabilities.self_upgrade import AuroraSelfUpgradeEngine
+          from capabilities.music_conduit import MusicConduit
+          from modes import discover_mode_packages
+          modes = discover_mode_packages()
+          print('Discovered modes:', list(modes.keys()))
+          assert 'gaming' in modes and 'realtor' in modes
+          for m_key in modes:
+              prof = profiles.DomainConfig.load_base_profile_from_python_file(m_key)
+              print('Validated profile:', m_key, prof.bot_name)
+          print('ALL CI VALIDATION CHECKS PASSED!')
+          "
