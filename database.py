@@ -1,11 +1,10 @@
 """
 database.py
-Encapsulates isolated per-mode SQLite databases (aurora_core.db for gaming,
-realtor_core.db for realtor, <mode>_core.db for custom modes), L1/L2 memory retrieval,
-database-backed Mode & UI String Overrides (with instant fallback to Python defaults),
-bulk DataFrame editors for double-click st.data_editor tables,
-live thread-safe SQLite .backup() export/restore, and automatic persistence
-to a dedicated 'db-vault' branch on GitHub (including site_state & custom_modes).
+Encapsulates isolated per-mode SQLite databases (aurora_core.db, realtor_core.db,
+<mode>_core.db), L1/L2 memory retrieval, Mode & UI String Overrides,
+Unresolved Problems & Self-Upgrade Proposals ledgers (`unresolved_issues`,
+`upgrade_proposals`, `r2_media_archive`), live SQLite .backup() export/restore,
+and dual cloud persistence to BOTH GitHub ('db-vault') AND Cloudflare R2 (YYYY/MM/DD).
 """
 
 import os
@@ -26,18 +25,13 @@ from profiles import (
     SITE_STATE_FILE,
     CUSTOM_MODES_FILE,
     get_secret_or_env,
-    get_deployment_namespace,
 )
+from capabilities.r2_storage import CloudflareR2Manager
 
 
 class GitHubVaultSync:
-    """
-    Synchronizes each mode's isolated SQLite .db file and global site state files
-    to a dedicated branch (default: 'db-vault') in GitHub via REST API.
-    """
-
     def __init__(self, db_filename: str):
-        self.db_filename = db_filename
+        self.db_filename = os.path.basename(db_filename)
         self.token = get_secret_or_env("GITHUB_TOKEN", "")
         self.repo = get_secret_or_env("GITHUB_REPO", "") or self._detect_repo_from_git()
         self.branch = get_secret_or_env("GITHUB_VAULT_BRANCH", "db-vault")
@@ -103,7 +97,7 @@ class GitHubVaultSync:
 
     def pull_file_from_vault(self, remote_path: str, local_path: str) -> Tuple[bool, str]:
         if not self.is_configured:
-            return False, "GITHUB_TOKEN not set in Streamlit Secrets."
+            return False, "GITHUB_TOKEN not set in Secrets."
 
         try:
             url = f"https://api.github.com/repos/{self.repo}/contents/{remote_path}?ref={self.branch}"
@@ -123,6 +117,9 @@ class GitHubVaultSync:
             else:
                 return False, "Empty file payload from GitHub."
 
+            parent = os.path.dirname(local_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(local_path, "wb") as f:
                 f.write(raw_bytes)
 
@@ -134,7 +131,7 @@ class GitHubVaultSync:
 
     def push_bytes_to_vault(self, remote_path: str, raw_bytes: bytes, commit_msg: str) -> Tuple[bool, str]:
         if not self.is_configured:
-            return False, "GITHUB_TOKEN not set in Streamlit Secrets."
+            return False, "GITHUB_TOKEN not set in Secrets."
 
         with self._lock:
             try:
@@ -164,54 +161,61 @@ class GitHubVaultSync:
 
 
 class DatabaseManager:
-    """
-    Thread-safe Mode-Isolated SQLite Manager.
-    Each mode operates on its own isolated .db file (e.g., aurora_core.db vs realtor_core.db),
-    while sharing site-wide mode state via site_state.json + GitHub db-vault.
-    """
-
     def __init__(self, profile: BotProfile):
         self.profile = profile
-        self.db_file = profile.db_filename
+        self.db_file = profile.resolved_db_path
+        self.db_basename = os.path.basename(self.db_file)
         self.write_lock = threading.Lock()
-        self.vault = GitHubVaultSync(self.db_file)
+        self.vault = GitHubVaultSync(self.db_basename)
+        self.r2 = CloudflareR2Manager()
         self._startup_restore_check()
         self.init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
+        parent = os.path.dirname(self.db_file)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         conn = sqlite3.connect(self.db_file, timeout=30.0, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
 
     def _startup_restore_check(self) -> None:
-        if not self.vault.is_configured:
-            return
-
         if not os.path.exists(self.db_file) or os.path.getsize(self.db_file) == 0:
-            ok, msg = self.vault.pull_file_from_vault(f"backups/{self.db_file}", self.db_file)
-            print(f"[GitHub Vault Startup Check - {self.db_file}] {msg}")
+            restored = False
+            if self.r2.is_configured:
+                ok_r2, raw_r2, msg_r2 = self.r2.download_bytes(f"backups/latest/{self.db_basename}")
+                if ok_r2 and raw_r2.startswith(b"SQLite format 3"):
+                    with open(self.db_file, "wb") as f:
+                        f.write(raw_r2)
+                    print(f"[R2 Startup Restore - {self.db_basename}] {msg_r2}")
+                    restored = True
+            if not restored and self.vault.is_configured:
+                ok, msg = self.vault.pull_file_from_vault(f"backups/{self.db_basename}", self.db_file)
+                print(f"[GitHub Vault Startup Check - {self.db_basename}] {msg}")
 
-        if not os.path.exists(CUSTOM_MODES_FILE):
-            self.vault.pull_file_from_vault(f"backups/{CUSTOM_MODES_FILE}", CUSTOM_MODES_FILE)
+        if not os.path.exists(CUSTOM_MODES_FILE) and self.vault.is_configured:
+            self.vault.pull_file_from_vault("backups/custom_modes.json", CUSTOM_MODES_FILE)
 
     def sync_json_file_to_vault(self, local_path: str, remote_path: str, commit_msg: str) -> None:
-        """Asynchronously pushes a small JSON state file (like site_state.json) to GitHub db-vault."""
-        if not self.vault.is_configured or not os.path.exists(local_path):
+        if not os.path.exists(local_path):
             return
 
         def _push():
             try:
                 with open(local_path, "rb") as f:
                     raw = f.read()
-                self.vault.push_bytes_to_vault(remote_path, raw, commit_msg)
+                if self.vault.is_configured:
+                    self.vault.push_bytes_to_vault(remote_path, raw, commit_msg)
+                if self.r2.is_configured:
+                    self.r2.upload_bytes(remote_path, raw, content_type="application/json")
             except Exception as e:
-                print(f"[JSON Vault Sync Notice]: {e}")
+                print(f"[JSON Dual Vault Sync Notice]: {e}")
 
         threading.Thread(target=_push, daemon=True).start()
 
     def trigger_background_sync(self, force: bool = False, reason: str = "Auto-sync") -> None:
-        if not self.vault.is_configured:
+        if not self.vault.is_configured and not self.r2.is_configured:
             return
         if not force and (time.time() - self.vault.last_sync_time) < 60:
             return
@@ -220,11 +224,16 @@ class DatabaseManager:
             raw_bytes = self.export_db_bytes()
             if raw_bytes:
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                self.vault.push_bytes_to_vault(
-                    f"backups/{self.db_file}",
-                    raw_bytes,
-                    f"[{self.profile.mode_key}] {reason} ({ts})",
-                )
+                if self.vault.is_configured:
+                    self.vault.push_bytes_to_vault(
+                        f"backups/{self.db_basename}",
+                        raw_bytes,
+                        f"[{self.profile.mode_key}] {reason} ({ts})",
+                    )
+                if self.r2.is_configured:
+                    dated_key = self.r2.build_dated_key("backups", self.db_basename, subfolder="databases")
+                    self.r2.upload_bytes(dated_key, raw_bytes, content_type="application/octet-stream")
+                    self.r2.upload_bytes(f"backups/latest/{self.db_basename}", raw_bytes, content_type="application/octet-stream")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -335,6 +344,47 @@ class DatabaseManager:
                 )
             """)
 
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS unresolved_issues (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT,
+                    summary TEXT,
+                    details TEXT,
+                    target_mode TEXT DEFAULT 'all',
+                    status TEXT DEFAULT 'open',
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS upgrade_proposals (
+                    slug TEXT PRIMARY KEY,
+                    title TEXT,
+                    scope TEXT,
+                    target_mode TEXT,
+                    files_json TEXT,
+                    branch_name TEXT,
+                    pr_number INTEGER DEFAULT 0,
+                    pr_url TEXT,
+                    status TEXT DEFAULT 'In Testing',
+                    ci_status TEXT DEFAULT 'pending',
+                    changelog TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS r2_media_archive (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT,
+                    media_type TEXT,
+                    r2_key TEXT UNIQUE,
+                    public_url TEXT,
+                    size_bytes INTEGER DEFAULT 0,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             for kw, topic, cat, tier, content, ver in self.profile.seed_docs:
                 c.execute(
                     """
@@ -357,7 +407,143 @@ class DatabaseManager:
             conn.commit()
             conn.close()
 
-    # --- MODE & UI STRING OVERRIDES ---
+    def record_unresolved_issue(self, category: str, summary: str, details: str, target_mode: str = "all") -> None:
+        with self.write_lock:
+            conn = self._get_conn()
+            conn.execute(
+                "INSERT INTO unresolved_issues (category, summary, details, target_mode, status) VALUES (?, ?, ?, ?, 'open')",
+                (category.strip(), summary.strip(), details.strip()[:2000], target_mode.strip()),
+            )
+            conn.commit()
+            conn.close()
+
+    def get_unresolved_issues(self, status_filter: str = "open") -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        c = conn.cursor()
+        if status_filter == "all":
+            c.execute("SELECT id, category, summary, details, target_mode, status, timestamp FROM unresolved_issues ORDER BY id DESC LIMIT 100")
+        else:
+            c.execute(
+                "SELECT id, category, summary, details, target_mode, status, timestamp FROM unresolved_issues WHERE status = ? ORDER BY id DESC LIMIT 100",
+                (status_filter,),
+            )
+        rows = [
+            {
+                "id": r[0],
+                "category": r[1],
+                "summary": r[2],
+                "details": r[3],
+                "target_mode": r[4],
+                "status": r[5],
+                "timestamp": r[6],
+            }
+            for r in c.fetchall()
+        ]
+        conn.close()
+        return rows
+
+    def mark_issue_resolved(self, issue_id: int) -> None:
+        with self.write_lock:
+            conn = self._get_conn()
+            conn.execute("UPDATE unresolved_issues SET status = 'resolved' WHERE id = ?", (int(issue_id),))
+            conn.commit()
+            conn.close()
+
+    def save_upgrade_proposal(self, record: Dict[str, Any]) -> None:
+        with self.write_lock:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO upgrade_proposals
+                (slug, title, scope, target_mode, files_json, branch_name, pr_number, pr_url, status, ci_status, changelog, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    record["slug"],
+                    record["title"],
+                    record.get("scope", "shared_capability"),
+                    record.get("target_mode", "all"),
+                    record.get("files_json", "[]"),
+                    record.get("branch_name", ""),
+                    int(record.get("pr_number", 0)),
+                    record.get("pr_url", ""),
+                    record.get("status", "In Testing"),
+                    record.get("ci_status", "pending"),
+                    record.get("changelog", ""),
+                ),
+            )
+            conn.commit()
+            conn.close()
+        self.trigger_background_sync(force=True, reason=f"Upgrade staged: {record['title']}")
+
+    def get_upgrade_proposals(self) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        c = conn.cursor()
+        c.execute(
+            "SELECT slug, title, scope, target_mode, files_json, branch_name, pr_number, pr_url, status, ci_status, changelog, created_at FROM upgrade_proposals ORDER BY created_at DESC"
+        )
+        rows = [
+            {
+                "slug": r[0],
+                "title": r[1],
+                "scope": r[2],
+                "target_mode": r[3],
+                "files": json.loads(r[4] or "[]"),
+                "branch_name": r[5],
+                "pr_number": r[6],
+                "pr_url": r[7],
+                "status": r[8],
+                "ci_status": r[9],
+                "changelog": r[10],
+                "created_at": r[11],
+            }
+            for r in c.fetchall()
+        ]
+        conn.close()
+        return rows
+
+    def update_proposal_status(self, slug: str, status: str, ci_status: Optional[str] = None) -> None:
+        with self.write_lock:
+            conn = self._get_conn()
+            if ci_status:
+                conn.execute("UPDATE upgrade_proposals SET status = ?, ci_status = ? WHERE slug = ?", (status, ci_status, slug))
+            else:
+                conn.execute("UPDATE upgrade_proposals SET status = ? WHERE slug = ?", (status, slug))
+            conn.commit()
+            conn.close()
+        self.trigger_background_sync(force=True, reason=f"Upgrade {slug} -> {status}")
+
+    def log_r2_media_download(self, title: str, media_type: str, r2_key: str, public_url: str, size_bytes: int) -> None:
+        with self.write_lock:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO r2_media_archive (title, media_type, r2_key, public_url, size_bytes, timestamp)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (title, media_type, r2_key, public_url, int(size_bytes)),
+            )
+            conn.commit()
+            conn.close()
+
+    def get_r2_media_archive(self) -> List[Dict[str, Any]]:
+        conn = self._get_conn()
+        c = conn.cursor()
+        c.execute("SELECT id, title, media_type, r2_key, public_url, size_bytes, timestamp FROM r2_media_archive ORDER BY id DESC LIMIT 100")
+        rows = [
+            {
+                "id": r[0],
+                "title": r[1],
+                "media_type": r[2],
+                "r2_key": r[3],
+                "public_url": r[4],
+                "size_bytes": r[5],
+                "timestamp": r[6],
+            }
+            for r in c.fetchall()
+        ]
+        conn.close()
+        return rows
 
     def get_mode_override(self, mode_key: str) -> Dict[str, Any]:
         try:
@@ -406,8 +592,6 @@ class DatabaseManager:
         except Exception:
             return []
 
-    # --- LIVE SAFE BACKUP & RESTORE (.backup() API) ---
-
     def export_db_bytes(self) -> bytes:
         tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db")
         os.close(tmp_fd)
@@ -450,7 +634,7 @@ class DatabaseManager:
 
             self.init_db()
             self.trigger_background_sync(force=True, reason="Manual DB Restore")
-            return True, f"Successfully restored {self.db_file} ({len(raw_bytes):,} bytes) and queued cloud sync!"
+            return True, f"Successfully restored {self.db_basename} ({len(raw_bytes):,} bytes) and queued cloud sync!"
         except Exception as e:
             return False, f"Restore failed: {e}"
         finally:
@@ -459,8 +643,6 @@ class DatabaseManager:
                     os.remove(tmp_path)
                 except OSError:
                     pass
-
-    # --- CHAT & LONG-TERM MEMORY (L1 + L2) ---
 
     def save_chat(self, user_id: str, channel_id: str, role: str, content: str) -> None:
         with self.write_lock:
@@ -621,8 +803,6 @@ class DatabaseManager:
             lines.append(f"  [{ts}] {role}: {content[:200]}")
         return "\n".join(lines)
 
-    # --- KNOWLEDGE BASE, STRATEGY DOCS & DATA_EDITOR BULK SYNC ---
-
     def query_local_docs(self, prompt: str, allowed_tiers: Optional[List[str]] = None) -> Optional[str]:
         clean = prompt.lower()
         conn = self._get_conn()
@@ -731,8 +911,6 @@ class DatabaseManager:
             conn.close()
         self.trigger_background_sync(force=True, reason="Bulk edited user_profiles table")
 
-    # --- JOKES & MEDIA VAULT ---
-
     def get_random_joke(self) -> str:
         conn = self._get_conn()
         c = conn.cursor()
@@ -801,8 +979,6 @@ class DatabaseManager:
             conn.execute("DELETE FROM media_vault WHERE id = ?", (int(media_id),))
             conn.commit()
             conn.close()
-
-    # --- SILENCE PROTOCOL & ABUSE TALLY ---
 
     def set_silence(self, channel_id: str, hours_min: int = 1, hours_max: int = 4) -> None:
         now = datetime.now(timezone.utc)

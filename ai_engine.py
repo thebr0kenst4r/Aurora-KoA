@@ -1,12 +1,13 @@
 """
 ai_engine.py
 Encapsulates the thread-safe Gemini API client rotation pool, retry backoff,
-multi-turn conversation history builder (with strict user/model role alternation),
-shared capability integration (MusicConduit & WebResearchSuite),
-trusted-domain verification, voice drafting for Discord broadcasts,
-and the Autonomous King of Avalon Update Scout.
+multi-turn conversation history builder, shared capability integration
+(MusicConduit, WebResearchSuite, CloudflareR2Manager, AuroraSelfUpgradeEngine),
+autonomous problem investigation & capability/mode synthesis,
+voice drafting for Discord broadcasts, and the Autonomous King of Avalon Update Scout.
 """
 
+import json
 import asyncio
 import threading
 import itertools
@@ -21,14 +22,8 @@ from database import DatabaseManager
 from capabilities import (
     MusicConduit,
     WebResearchSuite,
+    AuroraSelfUpgradeEngine,
     SEARCH_TRIGGERS,
-    AUDIO_OWNERSHIP_NOTICE,
-    is_song_request,
-    search_songs_hybrid,
-    convert_track_to_mp3_bytes,
-    convert_audio_url_to_mp3_bytes,
-    convert_m4a_url_to_mp3_bytes,
-    extract_and_convert_audio,
 )
 
 REMEMBER_TRIGGERS = ["remember", "!remember", "recall our chat", "what did we discuss", "check memory"]
@@ -42,19 +37,14 @@ def is_rate_limit_error(exception: BaseException) -> bool:
 
 
 class GeminiEngine:
-    """
-    Thread-safe AI Engine managing key rotation, multi-turn history formatting,
-    shared capabilities (MusicConduit + WebResearchSuite), trusted domain verification,
-    voice drafting, and autonomous King of Avalon update scouting.
-    """
-
     def __init__(self, profile: BotProfile, db: DatabaseManager):
         self.profile = profile
         self.db = db
         self.lock = threading.Lock()
         self.last_koa_scout_status: str = "Idle (Ready to scout)"
-        self.music = MusicConduit()
+        self.music = MusicConduit(issue_logger=db.record_unresolved_issue)
         self.researcher = WebResearchSuite(mode_key=profile.mode_key)
+        self.upgrader = AuroraSelfUpgradeEngine(db=db, r2_manager=db.r2)
 
         raw_keys = (
             get_secret_or_env("GEMINI_KEYS")
@@ -202,6 +192,114 @@ class GeminiEngine:
 
         return None
 
+    def synthesize_and_stage_upgrade(
+        self,
+        request_description: str,
+        scope: str = "shared_capability",
+        target_mode: str = "all",
+    ) -> Tuple[bool, str]:
+        client = self.get_next_client()
+        if not client:
+            return False, "No Gemini API key configured to synthesize code."
+
+        if scope == "new_mode":
+            clean_mode = target_mode.lower().strip().replace(" ", "_") or "counselling"
+            class_name = f"{clean_mode.title().replace('_', '')}Profile"
+            sys_prompt = (
+                "You are Aurora's Self-Upgrade Architect. Generate valid, clean Python code for a new "
+                f"self-contained deployment mode package `modes/{clean_mode}/`.\n"
+                "Return ONLY a JSON object with keys: "
+                '{"title": "...", "profile_code": "...", "capability_code": "...", "changelog": "..."}.\n'
+                f"`profile_code` MUST define `class {class_name}(BotProfile)` importing `from profiles import BotProfile` "
+                f"and `from modes.{clean_mode}.{clean_mode}_toolkit import render_{clean_mode}_tool`.\n"
+                f"`capability_code` MUST define `def render_{clean_mode}_tool() -> None:` using `import streamlit as st`."
+            )
+            user_prompt = f"Create mode '{clean_mode}' for: {request_description}"
+        elif scope == "mode_capability":
+            clean_mode = target_mode.lower().strip().replace(" ", "_") or self.profile.mode_key
+            sys_prompt = (
+                "You are Aurora's Self-Upgrade Architect. Generate a clean, standalone Python capability module "
+                f"to live inside `modes/{clean_mode}/`.\n"
+                "Return ONLY a JSON object with keys: "
+                '{"title": "...", "filename": "<snake_case>.py", "code": "...", "changelog": "..."}.\n'
+                "Include docstrings, type hints, and clean error handling."
+            )
+            user_prompt = f"Create mode-specific capability for '{clean_mode}': {request_description}"
+        else:
+            sys_prompt = (
+                "You are Aurora's Self-Upgrade Architect. Generate a clean, standalone shared Python capability module "
+                "to live inside `capabilities/` (available across all modes).\n"
+                "Return ONLY a JSON object with keys: "
+                '{"title": "...", "filename": "<snake_case>.py", "code": "...", "changelog": "..."}.\n'
+                "Include docstrings, type hints, and clean error handling."
+            )
+            user_prompt = f"Create shared cross-mode capability for: {request_description}"
+
+        try:
+            resp = client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=sys_prompt,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
+            )
+            parsed = json.loads((resp.text or "{}").strip())
+        except Exception as e:
+            self.db.record_unresolved_issue("self_upgrade_synthesis", f"Code synthesis failed: {request_description[:60]}", str(e), target_mode)
+            return False, f"Synthesis failed: {e}"
+
+        if scope == "new_mode":
+            clean_mode = target_mode.lower().strip().replace(" ", "_") or "counselling"
+            ok, msg, _ = self.upgrader.generate_new_mode_scaffold(
+                mode_slug=clean_mode,
+                bot_persona_name=parsed.get("title", f"Aurora {clean_mode.title()}"),
+                domain_description=request_description,
+                calculator_title=f"{clean_mode.title()} Toolkit",
+                generated_profile_code=parsed.get("profile_code", ""),
+                generated_capability_code=parsed.get("capability_code", ""),
+                changelog_note=parsed.get("changelog", request_description),
+            )
+            return ok, msg
+
+        raw_fname = parsed.get("filename", "auto_capability.py")
+        if not raw_fname.endswith(".py"):
+            raw_fname += ".py"
+        folder = "capabilities" if scope == "shared_capability" else f"modes/{target_mode}"
+        rel_path = f"{folder}/{raw_fname}"
+
+        ok, msg, _ = self.upgrader.stage_module_upgrade(
+            module_title=parsed.get("title", raw_fname),
+            target_files={rel_path: parsed.get("code", "")},
+            target_mode=target_mode,
+            scope=scope,
+            changelog_note=parsed.get("changelog", request_description),
+            write_locally=True,
+        )
+        return ok, msg
+
+    def investigate_and_propose_improvements(self) -> Tuple[bool, str]:
+        open_issues = self.db.get_unresolved_issues("open")
+        if open_issues:
+            top_issue = open_issues[0]
+            ok, msg = self.synthesize_and_stage_upgrade(
+                request_description=f"Resolve logged problem [{top_issue['category']}]: {top_issue['summary']} — {top_issue['details']}",
+                scope="shared_capability" if top_issue["target_mode"] == "all" else "mode_capability",
+                target_mode=top_issue["target_mode"],
+            )
+            if ok:
+                self.db.mark_issue_resolved(top_issue["id"])
+            return ok, msg
+
+        research_snip, _ = self.execute_multi_source_research("useful Python assistant automation utilities modular architecture")
+        prompt = (
+            f"As {self.profile.bot_name}, propose ONE focused, high-value Python utility capability "
+            f"that enhances all modes (e.g. structured schedule/reminder parser, markdown report exporter, "
+            f"or smart data validator). Context:\n{research_snip}"
+        )
+        return self.synthesize_and_stage_upgrade(prompt, scope="shared_capability", target_mode="all")
+
     def run_koa_auto_scout(self, custom_topic: str = "") -> Tuple[bool, str]:
         if not self.profile.enable_auto_scout and not custom_topic:
             return False, "Auto-Scout is disabled for this profile mode."
@@ -304,6 +402,7 @@ class GeminiEngine:
                     contents=contents,
                     config=config,
                 )
+            self.db.record_unresolved_issue("gemini_async_error", "Async generation rift", str(e), self.profile.mode_key)
             raise e
 
     def call_gemini_sync(
@@ -314,7 +413,7 @@ class GeminiEngine:
     ) -> str:
         active_client = self.get_next_client()
         if not active_client:
-            return "Configuration Notice: No Gemini API key found in Streamlit Secrets (`GEMINI_KEYS`)."
+            return "Configuration Notice: No Gemini API key found in Secrets (`GEMINI_KEYS`)."
 
         config = types.GenerateContentConfig(
             system_instruction=self.profile.build_effective_system_prompt(),
@@ -342,7 +441,9 @@ class GeminiEngine:
                     )
                     return resp2.text or "No response formed."
                 except Exception as e2:
+                    self.db.record_unresolved_issue("gemini_rate_limit", "Pool rate limit exhausted", str(e2), self.profile.mode_key)
                     return f"Resonance rate limit reached across pool: `{e2}`"
+            self.db.record_unresolved_issue("gemini_sync_error", "Sync generation rift", str(e), self.profile.mode_key)
             return f"A rift occurred in the resonance stream: `{e}`"
 
     async def maybe_update_user_summary(self, user_id: str) -> None:

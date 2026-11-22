@@ -1,11 +1,9 @@
 """
 profiles.py
 Master Mode Registry, Base Profile Class & Global Site-Wide Mode Persistence.
-Links each APP_MODE option ('gaming', 'realtor', etc.) to its dedicated mode package
-under modes/<mode_key>/ (e.g., modes/gaming/profile.py, modes/realtor/profile.py).
-Stores the active site mode globally via @st.cache_resource + site_state.json +
-GitHub 'db-vault' sync so switching modes with the Sovereign Key updates the
-active mode for ALL visitors on that deployment and persists across reboots.
+Supports built-in modes ('gaming', 'realtor') as well as dynamically generated mode
+packages under modes/<mode_key>/ created by Aurora's Self-Upgrade Core.
+Respects DATA_DIR for seamless migration from Streamlit Cloud to a dedicated server.
 """
 
 import os
@@ -17,14 +15,10 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Any, Optional, Callable
 import streamlit as st
 
-from modes import MODE_PACKAGE_REGISTRY
-
-SITE_STATE_FILE = "site_state.json"
-CUSTOM_MODES_FILE = "custom_modes.json"
+from modes import discover_mode_packages
 
 
 def get_secret_or_env(key: str, default: str = "") -> str:
-    """Safely retrieves a configuration value from environment variables or Streamlit secrets."""
     val = os.environ.get(key)
     if val is not None and str(val).strip() != "":
         return str(val).strip()
@@ -36,11 +30,18 @@ def get_secret_or_env(key: str, default: str = "") -> str:
     return default
 
 
+def get_data_dir() -> str:
+    base = get_secret_or_env("DATA_DIR", ".") or "."
+    if base != ".":
+        os.makedirs(base, exist_ok=True)
+    return base
+
+
+SITE_STATE_FILE = os.path.join(get_data_dir(), "site_state.json")
+CUSTOM_MODES_FILE = os.path.join(get_data_dir(), "custom_modes.json")
+
+
 def get_deployment_namespace() -> str:
-    """
-    Identifies this deployment instance on GitHub db-vault so a Gaming site and a Realtor site
-    can share the same GitHub repository without overwriting each other's active site mode.
-    """
     explicit_id = get_secret_or_env("SITE_ID", "")
     if explicit_id:
         return explicit_id.lower().strip().replace(" ", "_")
@@ -50,9 +51,6 @@ def get_deployment_namespace() -> str:
 
 @st.cache_resource
 def _get_global_site_state_holder() -> Dict[str, Any]:
-    """
-    Process-wide singleton shared across ALL browser sessions on this Streamlit deployment.
-    """
     default_mode = get_secret_or_env("APP_MODE", "gaming").lower().strip() or "gaming"
     active_mode = default_mode
 
@@ -83,10 +81,6 @@ def _get_global_site_state_holder() -> Dict[str, Any]:
 
 @dataclass
 class BotProfile:
-    """
-    Base configuration class for all deployment modes.
-    Subclasses in modes/gaming/profile.py and modes/realtor/profile.py define the Python defaults.
-    """
     mode_key: str = "base"
     page_title: str = "Aurora — The Broken Star"
     page_icon: str = "✨"
@@ -131,6 +125,13 @@ class BotProfile:
     seed_media: List[Tuple[str, str, str, str]] = field(default_factory=list)
 
     _python_defaults: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+
+    @property
+    def resolved_db_path(self) -> str:
+        data_dir = get_data_dir()
+        if os.path.dirname(self.db_filename):
+            return self.db_filename
+        return os.path.join(data_dir, self.db_filename)
 
     def snapshot_python_defaults(self) -> None:
         self._python_defaults = {
@@ -222,7 +223,6 @@ class BotProfile:
         return fallback
 
     def render_calculator(self) -> None:
-        """Invokes the modular calculator attached to this mode."""
         if callable(self.calculator_renderer):
             self.calculator_renderer()
         elif self.calculator_type == "realtor_mortgage":
@@ -256,16 +256,10 @@ class BotProfile:
 
 
 class DomainConfig:
-    """
-    Central Mode Factory & Global Site-Wide Mode Router.
-    Loads the dedicated mode subpackage under modes/<mode_key>/ and manages
-    site-wide persistent mode switching for all users.
-    """
-
     @classmethod
     def get_available_modes(cls, custom_modes_from_db: Optional[List[str]] = None) -> List[str]:
         holder = _get_global_site_state_holder()
-        modes = list(MODE_PACKAGE_REGISTRY.keys())
+        modes = list(discover_mode_packages().keys())
         for m in holder.get("custom_modes", []):
             if m and m not in modes:
                 modes.append(m)
@@ -281,28 +275,24 @@ class DomainConfig:
         if not clean_slug:
             return
         holder = _get_global_site_state_holder()
-        if clean_slug not in holder["custom_modes"] and clean_slug not in MODE_PACKAGE_REGISTRY:
+        discovered = discover_mode_packages()
+        if clean_slug not in holder["custom_modes"] and clean_slug not in discovered:
             holder["custom_modes"].append(clean_slug)
         try:
             with open(CUSTOM_MODES_FILE, "w", encoding="utf-8") as f:
                 json.dump(holder["custom_modes"], f, indent=2)
             if db is not None and hasattr(db, "sync_json_file_to_vault"):
-                db.sync_json_file_to_vault(CUSTOM_MODES_FILE, f"backups/{CUSTOM_MODES_FILE}", f"Registered custom mode {clean_slug}")
+                db.sync_json_file_to_vault(CUSTOM_MODES_FILE, "backups/custom_modes.json", f"Registered custom mode {clean_slug}")
         except Exception as e:
             print(f"[Custom Mode Registry Notice]: {e}")
 
     @classmethod
     def get_active_mode_key(cls) -> str:
-        """Returns the active mode for the ENTIRE deployment site (shared across all visitors)."""
         holder = _get_global_site_state_holder()
         return holder["active_mode"]
 
     @classmethod
     def set_active_mode_key(cls, new_mode: str, db: Any = None) -> str:
-        """
-        Persistently switches the active mode for ALL visitors on this site,
-        writes site_state.json locally, and syncs it to GitHub db-vault.
-        """
         clean_mode = new_mode.lower().strip().replace(" ", "_")
         if not clean_mode:
             return cls.get_active_mode_key()
@@ -333,11 +323,13 @@ class DomainConfig:
     @classmethod
     def load_base_profile_from_python_file(cls, mode_key: str = "") -> BotProfile:
         target_mode = (mode_key or cls.get_active_mode_key()).lower().strip()
+        registry = discover_mode_packages()
 
-        if target_mode in MODE_PACKAGE_REGISTRY:
-            module_name, class_name = MODE_PACKAGE_REGISTRY[target_mode]
+        if target_mode in registry:
+            module_name, class_name = registry[target_mode]
             try:
                 mod = importlib.import_module(module_name)
+                importlib.reload(mod)
                 prof_cls = getattr(mod, class_name)
                 profile: BotProfile = prof_cls()
             except Exception as e:

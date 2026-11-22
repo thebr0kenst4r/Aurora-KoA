@@ -1,10 +1,12 @@
 """
 bot.py
-Smart Assistant for Thebr0kenst4r (Aurora — Gaming Mode & Aria — Realtor Mode).
-Lightweight Streamlit + Discord + Watchdog entrypoint orchestrating:
-- Global site-wide persistent mode switching (DomainConfig)
-- Isolated per-mode SQLite databases (DatabaseManager)
-- Shared cross-mode capabilities (capabilities/) & modular mode subpackages (modes/)
+Smart Assistant for Thebr0kenst4r (Aurora — Gaming Mode, Aria — Realtor Mode,
+plus any dynamically synthesized modes).
+Server-ready Streamlit + Discord + Watchdog entrypoint supporting:
+  - Global site-wide persistent mode switching (DomainConfig)
+  - Isolated per-mode SQLite databases (DatabaseManager)
+  - Dual GitHub ('db-vault') + Cloudflare R2 (YYYY/MM/DD) scheduled backups
+  - Shared cross-mode capabilities (Self-Upgrade Core, R2, 403-Resilient Media Conduit, Web Research)
 """
 
 import os
@@ -12,6 +14,7 @@ import json
 import time
 import threading
 import urllib.request
+from datetime import datetime, timezone
 import streamlit as st
 
 from profiles import DomainConfig, SITE_STATE_FILE, get_deployment_namespace
@@ -23,10 +26,6 @@ from web_ui import StreamlitUI
 
 @st.cache_resource
 def _bootstrap_global_site_state() -> bool:
-    """
-    On fresh container boot, restores site_state.json from GitHub db-vault
-    (namespaced per deployment) so any Sovereign mode switch persists across reboots.
-    """
     if not os.path.exists(SITE_STATE_FILE):
         vault = GitHubVaultSync("site_state")
         if vault.is_configured:
@@ -58,11 +57,6 @@ st.set_page_config(
 
 @st.cache_resource
 def get_core_services(mode_key: str):
-    """
-    Initializes singleton backend services per mode_key so each mode maintains
-    its own isolated SQLite database (aurora_core.db vs realtor_core.db),
-    API key rotation pool, DiscordWorker, and Watchdog threads.
-    """
     profile = DomainConfig.load_base_profile_from_python_file(mode_key)
     db_manager = DatabaseManager(profile)
 
@@ -109,6 +103,14 @@ def get_core_services(mode_key: str):
                     force=True,
                     reason=f"Scheduled {profile.backup_interval_hours}h Auto-Backup",
                 )
+                if db_manager.r2.is_configured:
+                    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                    changelog_md = f"# Scheduled Backup ({ts})\n- Mode: `{mode_key}`\n- DB: `{db_manager.db_basename}`\n"
+                    db_manager.r2.run_full_dated_backup(
+                        {db_manager.db_basename: db_manager.export_db_bytes()},
+                        b"",
+                        changelog_md,
+                    )
 
     if not any(t.name == f"Watchdog_{mode_key}" and t.is_alive() for t in threading.enumerate()):
         threading.Thread(target=_watchdog_keepalive_and_backup, name=f"Watchdog_{mode_key}", daemon=True).start()
